@@ -78,7 +78,13 @@ atomic counter.
    encoding, data page v1. Each thread writes its own `user_daily` file as it
    goes; the per-thread `(campaign, day)` counters are summed and written as
    one `campaign_daily` file. `day` is `INT32` with the `DATE` logical type.
-10. **Letting go.** Input files, the link maps and the scatter buffers are
+10. **Huge pages.** The scatter buffers and the link map are advised for
+    transparent huge pages on Linux, but only for as much memory as the
+    kernel reports free in blocks of 2 MB or more (`/proc/buddyinfo`) when
+    the run starts. Asking for more would make every page fault compact
+    memory first, which costs far more than small pages do; beyond the budget
+    the system's own setting applies.
+11. **Letting go.** Input files, the link maps and the scatter buffers are
     handed back to the kernel by the worker threads of the following stage,
     as soon as those run out of work (`MADV_DONTNEED` on Linux). What is
     still mapped at exit is torn down by one thread, and that time counts.
@@ -111,6 +117,9 @@ The binary takes no arguments. Environment:
 | `OUTPUT_DIR` | `/output` | `user_daily/` and `campaign_daily/` are created here |
 | `NCPU` | available cores | worker threads |
 | `SS_TIME` | unset | print stage timings to stderr |
+| `SS_THP` | unset | Linux: `1` always ask for huge pages, `0` always refuse them, `2` never advise; unset = ask within the free-memory budget |
+| `SS_THP_MB` | unset | Linux: the huge-page budget in MB, instead of reading `/proc/buddyinfo` |
+| `SS_POP` | unset | Linux: fault each file range in with one `MADV_POPULATE_READ` before it is parsed |
 | `SS_CHUNK`, `SS_PE_BITS`, `SS_PP_BITS`, `SS_NOCAP`, `SS_SPARSE`, `SS_WIDE`, `SS_IBASE` | unset | testing knobs: range size, partition counts, thread cap, sparse campaign counters, the wide event form, a shifted base for the ingest offsets |
 
 ## Libraries

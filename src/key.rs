@@ -310,6 +310,124 @@ pub fn release(ptr: *mut u8, len: usize) {
 
 pub const HUGE: usize = 2 << 20;
 
+/// Fault the pages of a mapped file range in with one call instead of one
+/// fault per 64 KB (`MADV_POPULATE_READ`, Linux 5.14; older kernels refuse
+/// it, which is fine). Only with `SS_POP` set: a knob for the scorer.
+pub fn populate(ptr: *const u8, len: usize) {
+    #[cfg(target_os = "linux")]
+    if len > 0 {
+        let a = ptr as usize & !4095;
+        unsafe {
+            madvise(a as *mut u8, ptr as usize + len - a, 22);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (ptr, len);
+}
+
+/// Transparent huge pages for `big_alloc`.
+///
+/// Asking for them (`MADV_HUGEPAGE`) is a clear win when the kernel has free
+/// 2 MB blocks: a fifth less time on the scatter buffers. When it has none,
+/// the same request makes every fault compact memory on the spot (the usual
+/// `defrag` setting is `madvise`), which costs far more than small pages do.
+/// So memory is asked for huge pages only up to what `/proc/buddyinfo` shows
+/// as free in blocks of 2 MB and more at the start; beyond that it is left
+/// to the system's default, which never stalls unless `defrag` is `always`,
+/// and then huge pages are refused.
+///
+/// `SS_THP` overrides: `1` always ask, `0` always refuse, `2` never advise.
+/// `SS_THP_MB` sets the amount to ask for, in MB, instead of reading it.
+#[cfg(target_os = "linux")]
+mod thp {
+    use std::sync::atomic::{AtomicI64, AtomicU8, Ordering::Relaxed};
+
+    const ASK: u8 = 1;
+    const REFUSE: u8 = 0;
+    const LEAVE: u8 = 2;
+    const BUDGET: u8 = 3;
+    const UNSET: u8 = 255;
+    static MODE: AtomicU8 = AtomicU8::new(UNSET);
+    /// Bytes that may still be advised in `BUDGET` mode.
+    static LEFT: AtomicI64 = AtomicI64::new(0);
+    /// What to do once the budget is used up: `LEAVE` or `REFUSE`.
+    static AFTER: AtomicU8 = AtomicU8::new(LEAVE);
+
+    /// Free memory in blocks of at least 2 MB, from the text of
+    /// `/proc/buddyinfo`: one line per zone, after the zone's name the number
+    /// of free blocks of 1, 2, 4, ... pages. `None` if it does not parse.
+    pub fn free_huge(text: &str, page: usize) -> Option<u64> {
+        let min_order = (super::HUGE / page).trailing_zeros() as usize;
+        let mut total = 0u64;
+        let mut lines = 0;
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            // "Node 0, zone Normal 12 5 ..."
+            if it.next() != Some("Node") || it.nth(1) != Some("zone") || it.next().is_none() {
+                return None;
+            }
+            for (order, n) in it.enumerate() {
+                let n: u64 = n.parse().ok()?;
+                if order >= min_order && order < 40 {
+                    total = total.saturating_add(n.saturating_mul((page as u64) << order));
+                }
+            }
+            lines += 1;
+        }
+        if lines == 0 {
+            None
+        } else {
+            Some(total)
+        }
+    }
+
+    fn init() -> u8 {
+        // `SS_THP_MB` (testing) stands in for what the kernel reports. Others
+        // allocate as well: count on four fifths of that.
+        let free = match std::env::var("SS_THP_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            Some(mb) => Some(mb.saturating_mul(1 << 20)),
+            None => std::fs::read_to_string("/proc/buddyinfo").ok().and_then(|t| free_huge(&t, 4096)).map(|f| f / 5 * 4),
+        };
+        let mode = match std::env::var("SS_THP").ok().as_deref().map(str::trim) {
+            Some("1") => ASK,
+            Some("0") => REFUSE,
+            Some("2") => LEAVE,
+            _ => match free {
+                Some(free) => {
+                    LEFT.store(free.min(i64::MAX as u64) as i64, Relaxed);
+                    let defrag = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/defrag").unwrap_or_default();
+                    AFTER.store(if defrag.contains("[always]") { REFUSE } else { LEAVE }, Relaxed);
+                    BUDGET
+                }
+                // Nothing known: ask, as a system with free memory wants it.
+                None => ASK,
+            },
+        };
+        MODE.store(mode, Relaxed);
+        mode
+    }
+
+    pub fn advise(a: *mut u8, len: usize) {
+        let mut mode = MODE.load(Relaxed);
+        if mode == UNSET {
+            // Two threads may both get here; they come to the same result.
+            mode = init();
+        }
+        if mode == BUDGET {
+            mode = if LEFT.fetch_sub(len as i64, Relaxed) >= len as i64 { ASK } else { AFTER.load(Relaxed) };
+        }
+        let advice = match mode {
+            ASK => 14,    // MADV_HUGEPAGE
+            REFUSE => 15, // MADV_NOHUGEPAGE
+            _ => return,
+        };
+        // Fine if it is refused.
+        unsafe {
+            super::madvise(a, len, advice);
+        }
+    }
+}
+
 /// Map a whole file read-only. `None` if the kernel refuses.
 pub fn map_ro(fd: i32, len: usize) -> Option<*const u8> {
     // PROT_READ = 1, MAP_PRIVATE = 2 on Linux and macOS.
@@ -337,9 +455,7 @@ pub fn big_alloc(bytes: usize) -> *mut u8 {
     if p as isize != -1 && !p.is_null() {
         let a = ((p as usize + HUGE - 1) & !(HUGE - 1)) as *mut u8;
         #[cfg(target_os = "linux")]
-        unsafe {
-            madvise(a, len, 14); // MADV_HUGEPAGE; fine if it is refused
-        }
+        thp::advise(a, len);
         return a;
     }
     let layout = std::alloc::Layout::from_size_align(len, HUGE).unwrap();
@@ -486,6 +602,18 @@ impl BMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buddyinfo() {
+        let t = "Node 0, zone      DMA      1      1      0      0      2      1      1      0      1      1      3\n\
+                 Node 0, zone   Normal    100     50     20     10      5      4      3      2      1      7      9\n";
+        // orders 9 and 10 of both zones: (1 + 7) * 2 MB + (3 + 9) * 4 MB
+        assert_eq!(thp::free_huge(t, 4096), Some((8 * 2 + 12 * 4) << 20));
+        assert_eq!(thp::free_huge("", 4096), None);
+        assert_eq!(thp::free_huge("garbage here\n", 4096), None);
+        assert_eq!(thp::free_huge("Node 0, zone Normal 1 x 3\n", 4096), None);
+    }
 
     #[test]
     fn keys_are_exact_and_ordered() {

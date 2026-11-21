@@ -5,7 +5,7 @@ mod pq;
 mod scan;
 mod ts;
 
-use key::{big_alloc, compact_bytes, hash, is_long, key_bytes, key_cmp, make_key, map_ro, prefetch, release, BMap, KMap, Key, HUGE};
+use key::{big_alloc, compact_bytes, hash, is_long, key_bytes, key_cmp, make_key, map_ro, populate, prefetch, release, BMap, KMap, Key, HUGE};
 use pq::{Col, ColDef, Ty, Writer};
 use scan::{chunk_bounds, fields, Scanner};
 use std::cmp::Ordering;
@@ -282,6 +282,14 @@ unsafe impl Sync for MFile {}
 impl MFile {
     fn bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// The raw range `rs..re` is about to be read (see `key::populate`).
+    #[inline]
+    fn prepare(&self, pop: bool, rs: usize, re: usize) {
+        if pop && self.mapped {
+            populate(unsafe { self.ptr.add(rs) }, re - rs);
+        }
     }
 }
 
@@ -1498,6 +1506,7 @@ fn main() {
     let lbytes: usize = lfiles.iter().map(|f| f.len).sum();
 
     let chunk = env_usize("SS_CHUNK").unwrap_or(4 << 20).max(1);
+    let pop = std::env::var_os("SS_POP").is_some();
     let nt = if std::env::var_os("SS_NOCAP").is_some() {
         ncpu
     } else {
@@ -1554,6 +1563,7 @@ fn main() {
                 break;
             }
             let (fi, rs, re) = lchunks[i];
+            lfiles[fi].prepare(pop, rs, re);
             let buf = lfiles[fi].bytes();
             let (s, e) = chunk_bounds(buf, rs, re);
             parse_links(&buf[s..e], &mut out);
@@ -1583,6 +1593,7 @@ fn main() {
                     break;
                 }
                 let (fi, rs, re) = echunks[i];
+                efiles[fi].prepare(pop, rs, re);
                 let buf = efiles[fi].bytes();
                 let (s, e) = chunk_bounds(buf, rs, re);
                 parse_events(&buf[s..e], cx, link_cell.get(), &mut out);
@@ -1627,6 +1638,7 @@ fn main() {
                 break;
             }
             let (fi, rs, re) = cchunks[i];
+            cfiles[fi].prepare(pop, rs, re);
             let buf = cfiles[fi].bytes();
             let (s, e) = chunk_bounds(buf, rs, re);
             parse_clicks(&buf[s..e], cx, links, &mut out);
