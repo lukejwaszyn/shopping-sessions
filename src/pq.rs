@@ -145,7 +145,8 @@ impl Writer {
         if rows == 0 {
             return;
         }
-        self.buf.clear();
+        // Page headers and levels are gathered in `buf`; the column data is
+        // written straight from the caller's buffers, one write per column.
         let mut metas = Vec::with_capacity(cols.len());
         for c in cols {
             // Definition levels for the optional column: RLE/bit-packed
@@ -189,18 +190,20 @@ impl Writer {
             h.i32(4, 3); // repetition levels: RLE
             h.struct_end();
             h.b.push(0);
-            let start = self.offset + self.buf.len() as u64;
+            self.buf.clear();
             self.buf.extend_from_slice(&h.b);
             self.buf.extend_from_slice(&levels);
-            self.buf.extend_from_slice(data);
-            metas.push(ChunkMeta {
-                offset: start,
-                size: (h.b.len() + levels.len() + data.len()) as u64,
-                num_values: rows as u64,
-            });
+            let size = (self.buf.len() + data.len()) as u64;
+            if data.len() < 4096 {
+                self.buf.extend_from_slice(data);
+                self.file.write_all(&self.buf).unwrap();
+            } else {
+                self.file.write_all(&self.buf).unwrap();
+                self.file.write_all(data).unwrap();
+            }
+            metas.push(ChunkMeta { offset: self.offset, size, num_values: rows as u64 });
+            self.offset += size;
         }
-        self.file.write_all(&self.buf).unwrap();
-        self.offset += self.buf.len() as u64;
         self.rgs.push(RgMeta { rows: rows as u64, cols: metas });
     }
 

@@ -318,6 +318,53 @@ fn small_csv(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
     out
 }
 
+/// products.csv: the product -> category map, the categories numbered in
+/// byte-wise order (`unknown` is one of them), and the number of `unknown`.
+fn load_products(path: &Path) -> (KMap, Vec<Vec<u8>>, u32) {
+    let buf = std::fs::read(path).unwrap_or_default();
+    let (s, e) = chunk_bounds(&buf, 0, buf.len());
+    let b = &buf[s..e];
+    let mut sc = Scanner::new(b);
+    let mut pos = [0usize; 8];
+    let mut f = [(0usize, 0usize); 2];
+    // Categories in order of first appearance, and each row's product with
+    // its category's number in that order.
+    let mut seen: HashMap<&[u8], u32> = HashMap::new();
+    let mut names: Vec<&[u8]> = Vec::new();
+    let mut rows: Vec<(Key, u32)> = Vec::new();
+    let mut last: (&[u8], u32) = (&[], u32::MAX);
+    while let Some(l) = sc.next(&mut pos) {
+        if !fields(b, &l, &pos, &mut f) {
+            continue;
+        }
+        let cat = &b[f[1].0..f[1].1];
+        if last.1 == u32::MAX || last.0 != cat {
+            let next = names.len() as u32;
+            let id = *seen.entry(cat).or_insert(next);
+            if id == next {
+                names.push(cat);
+            }
+            last = (cat, id);
+        }
+        if f[0].0 != f[0].1 {
+            rows.push((make_key(b, f[0].0, f[0].1), last.1));
+        }
+    }
+    let mut cats: Vec<Vec<u8>> = names.iter().map(|c| c.to_vec()).collect();
+    cats.push(b"unknown".to_vec());
+    cats.sort();
+    cats.dedup();
+    let number = |c: &[u8]| cats.binary_search_by(|x| x.as_slice().cmp(c)).unwrap() as u32;
+    let remap: Vec<u32> = names.iter().map(|c| number(c)).collect();
+    let mut products = KMap::new(rows.len());
+    for &(k, c) in &rows {
+        // The first row of a product wins; the file has one row each.
+        products.get_or_insert(k, remap[c as usize] as u128);
+    }
+    let unknown = number(b"unknown");
+    (products, cats, unknown)
+}
+
 fn manifest_ts(text: &[u8], name: &str) -> i64 {
     let pat = format!("\"{}\"", name);
     let find = |h: &[u8], n: &[u8]| h.windows(n.len()).position(|w| w == n);
@@ -1263,20 +1310,15 @@ fn main() {
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
 
-    // Categories, numbered in byte-wise order; `unknown` is one of them.
-    let prows = small_csv(&data.join("products.csv"));
-    let mut cats: Vec<Vec<u8>> = prows.iter().map(|r| r.1.clone()).collect();
-    cats.push(b"unknown".to_vec());
-    cats.sort();
-    cats.dedup();
-    let cat_idx: HashMap<&[u8], u32> = cats.iter().enumerate().map(|(i, c)| (c.as_slice(), i as u32)).collect();
-    let mut products = KMap::new(prows.len());
-    for (id, cat) in &prows {
-        if !id.is_empty() {
-            products.get_or_insert(make_key(id, 0, id.len()), cat_idx[cat.as_slice()] as u128);
-        }
-    }
-    let unknown_cat = cat_idx[&b"unknown"[..]];
+    // The event files are mapped on a second thread while this one reads
+    // the small tables and maps the rest.
+    let (efiles, (products, cats, unknown_cat), cfiles, lfiles) = std::thread::scope(|s| {
+        let ev = s.spawn(|| map_dir(&data.join("events")));
+        let prod = load_products(&data.join("products.csv"));
+        let cfiles = map_dir(&data.join("clicks"));
+        let lfiles = map_dir(&data.join("links"));
+        (ev.join().unwrap(), prod, cfiles, lfiles)
+    });
 
     let crows = small_csv(&data.join("campaigns.csv"));
     let mut campaigns = KMap::new(crows.len());
@@ -1293,9 +1335,6 @@ fn main() {
         }
     }
 
-    let efiles = map_dir(&data.join("events"));
-    let cfiles = map_dir(&data.join("clicks"));
-    let lfiles = map_dir(&data.join("links"));
     let ebytes: usize = efiles.iter().map(|f| f.len).sum();
     let cbytes: usize = cfiles.iter().map(|f| f.len).sum();
     let lbytes: usize = lfiles.iter().map(|f| f.len).sum();
