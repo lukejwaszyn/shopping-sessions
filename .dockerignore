@@ -1,0 +1,10 @@
+.git
+target/
+fixtures/
+scripts/
+dev/
+dev-answer/
+out/
+*.md
+Makefile
+LICENSE

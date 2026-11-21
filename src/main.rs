@@ -5,7 +5,7 @@ mod pq;
 mod scan;
 mod ts;
 
-use key::{hash, key_bytes, key_cmp, make_key, prefetch, KMap, Key};
+use key::{big_alloc, hash, key_bytes, key_cmp, make_key, map_ro, prefetch, KMap, Key};
 use pq::{Col, ColDef, Ty, Writer};
 use scan::{chunk_bounds, fields, Scanner};
 use std::cmp::Ordering;
@@ -70,7 +70,7 @@ const CCAP: usize = 128;
 
 // ---------------------------------------------------------------- buckets
 
-const SLAB: usize = 4 << 20;
+const SLAB: usize = 8 << 20;
 
 /// Bump allocator. Memory is never returned: the process exits when done.
 struct Arena {
@@ -83,12 +83,7 @@ impl Arena {
         let bytes = (bytes + 15) & !15;
         if bytes > self.left {
             let sz = SLAB.max(bytes);
-            let layout = std::alloc::Layout::from_size_align(sz, 4096).unwrap();
-            let p = unsafe { std::alloc::alloc(layout) };
-            if p.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            self.ptr = p;
+            self.ptr = big_alloc(sz);
             self.left = sz;
         }
         let p = self.ptr;
@@ -181,10 +176,6 @@ impl MFile {
     }
 }
 
-extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-}
-
 fn map_file(path: &Path) -> Option<MFile> {
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {}", path.display(), e));
@@ -192,13 +183,13 @@ fn map_file(path: &Path) -> Option<MFile> {
     if len == 0 {
         return None;
     }
-    // PROT_READ = 1, MAP_PRIVATE = 2 on Linux and macOS.
-    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) };
-    if p as isize == -1 || p.is_null() {
-        let v = std::fs::read(path).unwrap().leak();
-        return Some(MFile { ptr: v.as_ptr(), len: v.len() });
+    match map_ro(f.as_raw_fd(), len) {
+        Some(ptr) => Some(MFile { ptr, len }),
+        None => {
+            let v = std::fs::read(path).unwrap().leak();
+            Some(MFile { ptr: v.as_ptr(), len: v.len() })
+        }
     }
-    Some(MFile { ptr: p, len })
 }
 
 /// Every `*.csv` file of a directory, memory-mapped. Empty files are skipped.
@@ -269,7 +260,6 @@ struct Ctx {
     camp_channels: Vec<Vec<u8>>,
     pe_bits: u32,
     pp_bits: u32,
-    nt: usize,
     out_dir: PathBuf,
 }
 
@@ -469,7 +459,7 @@ fn build_links(lists: Vec<Vec<(Key, Key)>>) -> KMap {
             best[r] = keys[i];
         }
     }
-    for s in map.slots.iter_mut() {
+    for s in map.slots_mut().iter_mut() {
         if s.k != 0 {
             s.v = best[find(&mut parent, s.v as u32) as usize];
         }
@@ -1113,7 +1103,6 @@ fn main() {
         camp_channels,
         pe_bits,
         pp_bits,
-        nt,
         out_dir,
     };
     let cx = &cx;
@@ -1258,7 +1247,6 @@ fn main() {
     );
     w.finish();
     lap("campaign_daily written");
-    let _ = cx.nt;
     // Skip destructors: unmapping gigabytes is the kernel's job at exit.
     std::process::exit(0);
 }
