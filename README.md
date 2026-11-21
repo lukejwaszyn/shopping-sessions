@@ -23,7 +23,8 @@ atomic counter.
    simply yield no ranges or no rows.
 2. **CSV scanning** (`src/scan.rs`). A block of 64 bytes is turned into three
    bitmasks: delimiters, newlines, quotes (AVX2 on x86-64, NEON on arm64, a
-   scalar loop elsewhere). A line is a walk over delimiter bits. Every comma
+   scalar loop elsewhere). A line is a walk over delimiter bits; splitting it
+   into dequoted fields is branch-free. Every comma
    separates fields and only `\n` ends a line, so no quote state is needed; a
    line is malformed when its field count is wrong or when its number of quote
    characters is not exactly twice the number of fields that start and end
@@ -34,28 +35,37 @@ atomic counter.
    in a global table. Equality is always on the exact key; hashes only choose
    partitions and table slots.
 4. **Links.** Link lines are parsed in parallel, then one thread runs a
-   union-find and names each component by its byte-wise smallest ID. The
-   result is one flat table from linked ID to person name; an ID that is not
-   in it is its own person. This runs while the other threads parse events.
-5. **Events, pass 1.** Each row is parsed and validated on the spot
-   (timestamps in all three forms, window, type, product, price, lateness),
-   because validity is a property of the row. Valid or not, the row is
-   scattered into one of up to 2048 partitions by a hash of its `event_id`.
-6. **Events, pass 2: dedup before validation.** Each partition is deduplicated
-   in a cache-sized hash table: the copy with the smallest `ingest_ts` wins,
-   and if that copy is invalid the event is gone. Survivors get their person
-   from the link table (prefetched a few rows ahead) and are scattered by a
-   hash of the person.
+   union-find that keeps the byte-wise smallest ID at each root. The result is
+   one flat table from linked ID to person name; an ID that is not in it is
+   its own person. This runs while the other threads already parse events.
+5. **Events, one pass over the files.** Each row is parsed and validated on
+   the spot (timestamps in all three forms, window, type, product, price,
+   lateness), because validity is a property of the row. A valid row gets its
+   person from the link table (the slot is prefetched a few rows ahead) and is
+   scattered by a hash of the person: that record is final and never moves
+   again. Every row, valid or not, also leaves a 32-byte dedup record
+   (`event_id`, `ingest_ts`, pointer to the row's event record, null for an
+   invalid row), scattered by a hash of the `event_id`. Rows parsed before the
+   union-find has finished wait in a per-thread backlog.
+6. **Dedup before validation.** Each `event_id` partition is deduplicated in a
+   cache-sized hash table: the copy with the smallest `ingest_ts` wins, and
+   every losing copy that is a valid event is struck out in place through its
+   pointer. If the winner is an invalid row the event is gone, because all its
+   valid copies were struck out.
 7. **Clicks.** Parsed, validated and resolved to their person in one pass, and
    scattered into the same person partitions. Copies of a click are identical
    by the rules, and an identical copy can change neither the credited
    campaign nor the set of assisting campaigns, so no click dedup is needed.
-8. **Sessions.** Per person partition: events and clicks are grouped by person
-   with a counting sort, each person's events are sorted by `ts` and split
-   into sessions (gap over 30 minutes; equal timestamps share a session).
-   Clicks are sorted by `(ts, click_id)` and a sliding 7-day window is moved
-   over them as the sessions advance, keeping a count per campaign, so
-   crediting and assists cost O(clicks + sessions x distinct campaigns) even
+8. **Sessions.** Per person partition, biggest first: events and clicks are
+   grouped by person with a counting sort, each person's events are sorted by
+   `ts` (as 8-byte keys: offset in the window plus a purchase index; a 16-byte
+   form is the fallback for windows over 2^40 ms) and split into sessions (gap
+   over 30 minutes; equal timestamps share a session). Clicks are sorted by
+   `ts`, the smallest `click_id` of a tie is tracked, and a sliding 7-day
+   window is moved over them as the sessions advance, keeping a count per
+   campaign. An assist is not booked per session: a campaign covers a run of
+   consecutive sessions, booked when the run or the day ends, so crediting and
+   assists cost O(clicks + sessions) plus O(distinct campaigns) per day, even
    for the shared-device persons with thousands of merged people.
 9. **Output** (`src/pq.rs`). A minimal Parquet writer: uncompressed, PLAIN
    encoding, data page v1. Each thread writes its own `user_daily` file as it
@@ -90,7 +100,7 @@ The binary takes no arguments. Environment:
 | `OUTPUT_DIR` | `/output` | `user_daily/` and `campaign_daily/` are created here |
 | `NCPU` | available cores | worker threads |
 | `SS_TIME` | unset | print stage timings to stderr |
-| `SS_CHUNK`, `SS_PE_BITS`, `SS_PP_BITS`, `SS_NOCAP`, `SS_SPARSE` | unset | testing knobs: range size, partition counts, thread cap, sparse campaign counters |
+| `SS_CHUNK`, `SS_PE_BITS`, `SS_PP_BITS`, `SS_NOCAP`, `SS_SPARSE`, `SS_WIDE` | unset | testing knobs: range size, partition counts, thread cap, sparse campaign counters, 16-byte sort keys |
 
 ## Libraries
 
