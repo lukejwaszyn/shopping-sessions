@@ -29,24 +29,31 @@ atomic counter.
    line is malformed when its field count is wrong or when its number of quote
    characters is not exactly twice the number of fields that start and end
    with a quote.
-3. **Exact keys** (`src/key.rs`). Every ID becomes a `u128` that represents
-   the string exactly: up to 15 bytes are stored inline with the length (and
-   integer order equals byte-wise string order), longer strings are interned
-   in a global table. Equality is always on the exact key; hashes only choose
-   partitions and table slots.
+3. **Exact keys** (`src/key.rs`). Every ID becomes a `u64` that represents
+   the string exactly. A string of up to 10 bytes over `0-9 A-Z _ a-z` (every
+   ID the generator makes) is written as one 6-bit code per byte, so integer
+   order equals byte-wise string order; 16 bytes are classified at once (SSE2
+   on x86-64, NEON on arm64). Any other string is interned in a global table.
+   Equality is always on the exact key; hashes only choose partitions and
+   table slots.
 4. **Links.** Link lines are parsed in parallel, then one thread runs a
    union-find that keeps the byte-wise smallest ID at each root. The result is
-   one flat table from linked ID to person name; an ID that is not in it is
-   its own person. This runs while the other threads already parse events.
+   a map from each ID whose person has another name to that name, in buckets
+   of one cache line; an ID that is not in it is its own person. This runs
+   while the other threads already parse events.
 5. **Events, one pass over the files.** Each row is parsed and validated on
    the spot (timestamps in all three forms, window, type, product, price,
    lateness), because validity is a property of the row. A valid row gets its
-   person from the link table (the slot is prefetched a few rows ahead) and is
-   scattered by a hash of the person: that record is final and never moves
-   again. Every row, valid or not, also leaves a 32-byte dedup record
-   (`event_id`, `ingest_ts`, pointer to the row's event record, null for an
-   invalid row), scattered by a hash of the `event_id`. Rows parsed before the
-   union-find has finished wait in a per-thread backlog.
+   person from the link map (the bucket is prefetched a few rows ahead) and is
+   scattered by a hash of the person as a 16-byte record: the person and one
+   word holding `ts - window_start`, price and category. That record is final
+   and never moves again. Every row, valid or not, also leaves a 16-byte dedup
+   record, scattered by a hash of the `event_id`: the ID and one word holding
+   `ingest_ts` as a 21-bit offset and the address of the row's event record
+   (null for an invalid row). Values that do not fit these words (a window of
+   years, an `ingest_ts` weeks away from the window) go to side lists and stay
+   exact. Rows parsed before the union-find has finished wait in a per-thread
+   backlog.
 6. **Dedup before validation.** Each `event_id` partition is deduplicated in a
    cache-sized hash table: the copy with the smallest `ingest_ts` wins, and
    every losing copy that is a valid event is struck out in place through its
@@ -58,12 +65,12 @@ atomic counter.
    campaign nor the set of assisting campaigns, so no click dedup is needed.
 8. **Sessions.** Per person partition, biggest first: events and clicks are
    grouped by person with a counting sort, each person's events are sorted by
-   `ts` (as 8-byte keys: offset in the window plus a purchase index; a 16-byte
-   form is the fallback for windows over 2^40 ms) and split into sessions (gap
-   over 30 minutes; equal timestamps share a session). Clicks are sorted by
-   `ts`, the smallest `click_id` of a tie is tracked, and a sliding 7-day
-   window is moved over them as the sessions advance, keeping a count per
-   campaign. An assist is not booked per session: a campaign covers a run of
+   `ts` (the 8-byte word of the event record sorts by `ts` as it is; a 16-byte
+   form is the fallback when that word is an index into a side list) and split
+   into sessions (gap over 30 minutes; equal timestamps share a session).
+   Clicks are sorted by `ts`, the smallest `click_id` of a tie is tracked, and
+   a sliding 7-day window is moved over them as the sessions advance, keeping
+   a count per campaign. An assist is not booked per session: a campaign covers a run of
    consecutive sessions, booked when the run or the day ends, so crediting and
    assists cost O(clicks + sessions) plus O(distinct campaigns) per day, even
    for the shared-device persons with thousands of merged people.
@@ -71,6 +78,10 @@ atomic counter.
    encoding, data page v1. Each thread writes its own `user_daily` file as it
    goes; the per-thread `(campaign, day)` counters are summed and written as
    one `campaign_daily` file. `day` is `INT32` with the `DATE` logical type.
+10. **Letting go.** Input files, the link maps and the scatter buffers are
+    handed back to the kernel by the worker threads of the following stage,
+    as soon as those run out of work (`MADV_DONTNEED` on Linux). What is
+    still mapped at exit is torn down by one thread, and that time counts.
 
 ## Run and test
 
@@ -100,7 +111,7 @@ The binary takes no arguments. Environment:
 | `OUTPUT_DIR` | `/output` | `user_daily/` and `campaign_daily/` are created here |
 | `NCPU` | available cores | worker threads |
 | `SS_TIME` | unset | print stage timings to stderr |
-| `SS_CHUNK`, `SS_PE_BITS`, `SS_PP_BITS`, `SS_NOCAP`, `SS_SPARSE`, `SS_WIDE` | unset | testing knobs: range size, partition counts, thread cap, sparse campaign counters, 16-byte sort keys |
+| `SS_CHUNK`, `SS_PE_BITS`, `SS_PP_BITS`, `SS_NOCAP`, `SS_SPARSE`, `SS_WIDE`, `SS_IBASE` | unset | testing knobs: range size, partition counts, thread cap, sparse campaign counters, the wide event form, a shifted base for the ingest offsets |
 
 ## Libraries
 
@@ -112,7 +123,7 @@ organizers' starter and use `polars`.
 
 - `src/main.rs` pipeline stages
 - `src/scan.rs` CSV scanner
-- `src/key.rs` exact keys, hash map, allocation
+- `src/key.rs` exact keys, hash maps, allocation
 - `src/ts.rs` timestamp and number parsing
 - `src/pq.rs` Parquet writer
 - `fixtures/`, `scripts/`, `rules.md` from the organizers' kit
