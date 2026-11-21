@@ -5,7 +5,7 @@ mod pq;
 mod scan;
 mod ts;
 
-use key::{big_alloc, hash, is_long, key_bytes, key_cmp, make_key, map_ro, prefetch, KMap, Key};
+use key::{big_alloc, compact_bytes, hash, is_long, key_bytes, key_cmp, make_key, map_ro, prefetch, KMap, Key};
 use pq::{Col, ColDef, Ty, Writer};
 use scan::{chunk_bounds, fields, Scanner};
 use std::cmp::Ordering;
@@ -19,46 +19,67 @@ use ts::{parse_digits, parse_dt_c, parse_ts, DateCache};
 const GAP_MS: i64 = 1_800_000;
 const WEEK_MS: i64 = 604_800_000;
 const DAY_MS: i64 = 86_400_000;
-/// `ts` of an event that does not survive (invalid, late, or lost the dedup).
-const INVALID: i64 = i64::MIN;
 
 // ---------------------------------------------------------------- records
 
-/// A parsed, valid event row waiting for its person to be resolved, 56 bytes.
+/// A parsed, valid event row waiting for its person to be resolved, 32 bytes.
 #[derive(Clone, Copy)]
-#[repr(C, packed(8))]
+#[repr(C)]
 struct ERec {
     ek: Key,
     uk: Key,
-    ts: i64,
+    /// see `PRec`
+    w: u64,
     /// ingest_ts, epoch seconds
     ing: i64,
-    /// price_cents of a purchase, 0 for view and cart
-    price: u32,
-    cat: u32,
 }
 
-/// One event row as the dedup sees it: its ID, its ingest time and where its
-/// `PRec` lives (null for a row that failed validation). 32 bytes.
+/// One event row as the dedup sees it, 16 bytes: its ID and, in `x`, its
+/// ingest time and where its `PRec` lives (null for a row that failed
+/// validation).
+///
+/// `x` is `code << 43 | pointer >> 4`. The code is `ingest_ts - cx.ibase` in
+/// seconds when that is in `0..ING_ESC` (24 days from one day before the
+/// window: every row the generator makes). Any other row has the code
+/// `ING_ESC` and, instead of the pointer, `thread << 32 | index` of an entry
+/// in that thread's overflow list, which holds the exact values.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct DRec {
     ek: Key,
-    /// ingest_ts, epoch seconds
-    ing: i64,
-    ptr: *mut PRec,
+    x: u64,
 }
 
-/// A valid event, attached to its person. The dedup sets `ts` to `INVALID`
-/// when another copy of the event wins.
+const ING_ESC: u64 = (1 << 21) - 1;
+const PTR_BITS: u32 = 43;
+const PTR_MASK: u64 = (1 << PTR_BITS) - 1;
+
+/// Exact (ingest_ts, PRec address) of the rows that do not fit a `DRec`.
+type Over = Vec<(i64, usize)>;
+
+/// A valid event, attached to its person, 16 bytes. The dedup sets `w` to
+/// `DEAD` when another copy of the event wins.
+///
+/// Narrow form (`cx.narrow`): `w` is `(ts - window_start) << cx.ts_shift |
+/// price << cx.cat_bits | category`, price 0 for a view or a cart. It sorts
+/// by `ts` as it is. Wide form, for windows or category counts too big for
+/// that: `w` is `thread << 40 | index` into that thread's side list of
+/// `(ts, price, category)`.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PRec {
     person: Key,
-    ts: i64,
-    price: u32,
-    cat: u32,
+    w: u64,
 }
+
+/// No event has this `w`: in the narrow form its price field would be over
+/// the limit, in the wide form its thread number would be.
+const DEAD: u64 = u64::MAX;
+const PRICE_BITS: u32 = 24;
+const PRICE_MASK: u64 = (1 << PRICE_BITS) - 1;
+const SIDE_BITS: u32 = 40;
+
+type Side = Vec<(i64, u32, u32)>;
 
 /// A valid click, attached to its person.
 #[derive(Clone, Copy)]
@@ -292,8 +313,12 @@ struct Ctx {
     camp_channels: Vec<Vec<u8>>,
     pe_bits: u32,
     pp_bits: u32,
-    /// The window is short enough for the narrow event form.
+    /// Events are stored in the narrow form, see `PRec`.
     narrow: bool,
+    ts_shift: u32,
+    cat_bits: u32,
+    /// Base of the ingest codes, epoch seconds, see `DRec`.
+    ibase: i64,
     out_dir: PathBuf,
 }
 
@@ -359,7 +384,7 @@ fn load_products(path: &Path) -> (KMap, Vec<Vec<u8>>, u32) {
     let mut products = KMap::new(rows.len());
     for &(k, c) in &rows {
         // The first row of a product wins; the file has one row each.
-        products.get_or_insert(k, remap[c as usize] as u128);
+        products.get_or_insert(k, remap[c as usize] as u64);
     }
     let unknown = number(b"unknown");
     (products, cats, unknown)
@@ -398,32 +423,61 @@ fn parse_links(buf: &[u8], out: &mut Vec<(Key, Key)>) {
 /// `backlog`, afterwards they pass through a small ring while the link-map
 /// slot of their user is fetched from memory.
 struct EvOut {
+    t: usize,
     d: Buckets<DRec>,
     p: Buckets<PRec>,
     ring: [ERec; RING],
     n: usize,
     backlog: Vec<ERec>,
+    over: Over,
+    side: Side,
 }
 
 const RING: usize = 16;
 
 impl EvOut {
-    fn new(cx: &Ctx) -> EvOut {
+    fn new(cx: &Ctx, t: usize) -> EvOut {
+        assert!(t < 1 << 11);
         EvOut {
+            t,
             d: Buckets::new(1 << cx.pe_bits, DCAP),
             p: Buckets::new(1 << cx.pp_bits, PCAP),
-            ring: [ERec { ek: 0, uk: 0, ts: 0, ing: 0, price: 0, cat: 0 }; RING],
+            ring: [ERec { ek: 0, uk: 0, w: 0, ing: 0 }; RING],
             n: 0,
             backlog: Vec::new(),
+            over: Vec::new(),
+            side: Vec::new(),
         }
+    }
+
+    /// Leave the dedup record of a row: `ptr` is its `PRec`, null for a row
+    /// that failed validation.
+    #[inline(always)]
+    fn dedup_rec(&mut self, cx: &Ctx, ek: Key, ing: i64, ptr: *mut PRec) {
+        let code = ing.wrapping_sub(cx.ibase) as u64;
+        let addr = ptr as usize as u64;
+        let x = if code < ING_ESC && addr >> (PTR_BITS + 4) == 0 {
+            (code << PTR_BITS) | (addr >> 4)
+        } else {
+            self.escape(ing, ptr)
+        };
+        self.d.push(part(hash(ek), cx.pe_bits), DRec { ek, x });
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn escape(&mut self, ing: i64, ptr: *mut PRec) -> u64 {
+        let i = self.over.len() as u64;
+        assert!(i < 1 << 32);
+        self.over.push((ing, ptr as usize));
+        (ING_ESC << PTR_BITS) | ((self.t as u64) << 32) | i
     }
 
     #[inline(always)]
     fn resolve(&mut self, cx: &Ctx, links: &KMap, r: ERec) {
         let person = links.get(r.uk).unwrap_or(r.uk);
-        let rec = PRec { person, ts: r.ts, price: r.price, cat: r.cat };
-        let ptr = self.p.push_ptr(part(hash(person), cx.pp_bits), rec);
-        self.d.push(part(hash(r.ek), cx.pe_bits), DRec { ek: r.ek, ing: r.ing, ptr });
+        let ptr = self.p.push_ptr(part(hash(person), cx.pp_bits), PRec { person, w: r.w });
+        self.dedup_rec(cx, r.ek, r.ing, ptr);
     }
 
     /// Resolve everything that is waiting.
@@ -463,7 +517,8 @@ fn parse_events(buf: &[u8], cx: &Ctx, links: Option<&KMap>, out: &mut EvOut) {
         let ek = make_key(buf, f[0].0, f[0].1);
         let ib = &buf[f[3].0..f[3].1];
         let ing = if ib.len() == 20 && ib[19] == b'Z' { parse_dt_c(ib, &mut dc) } else { None };
-        let mut rec = ERec { ek, uk: 0, ts: INVALID, ing: ing.unwrap_or(i64::MAX), price: 0, cat: 0 };
+        // (user, w) of a row that passes validation
+        let mut valid: Option<(Key, u64)> = None;
         'v: {
             let Some(ing) = ing else { break 'v };
             let (us, ue) = f[1];
@@ -483,25 +538,35 @@ fn parse_events(buf: &[u8], cx: &Ctx, links: Option<&KMap>, out: &mut EvOut) {
                 b"purchase" => true,
                 _ => break 'v,
             };
+            let (mut price, mut cat) = (0u32, 0u32);
             if purchase {
                 let Some(p) = parse_digits(&buf[f[6].0..f[6].1], 8) else { break 'v };
                 if p < 1 || p > 10_000_000 {
                     break 'v;
                 }
-                rec.price = p as u32;
-                rec.cat = match cx.products.get(make_key(buf, ps, pe)) {
+                price = p as u32;
+                cat = match cx.products.get(make_key(buf, ps, pe)) {
                     Some(c) => c as u32,
                     None => cx.unknown_cat,
                 };
             }
-            rec.uk = make_key(buf, us, ue);
-            rec.ts = ts;
+            let w = if cx.narrow {
+                (((ts - cx.ws) as u64) << cx.ts_shift) | ((price as u64) << cx.cat_bits) | cat as u64
+            } else {
+                out.side.push((ts, price, cat));
+                ((out.t as u64) << SIDE_BITS) | (out.side.len() as u64 - 1)
+            };
+            valid = Some((make_key(buf, us, ue), w));
         }
-        if rec.ts == INVALID {
+        let Some((uk, w)) = valid else {
             // Not a surviving event, but it still takes part in the dedup.
-            out.d.push(part(hash(ek), cx.pe_bits), DRec { ek, ing: rec.ing, ptr: std::ptr::null_mut() });
-        } else if let Some(links) = links {
-            prefetch(links.slot_ptr(rec.uk));
+            out.dedup_rec(cx, ek, ing.unwrap_or(i64::MAX), std::ptr::null_mut());
+            continue;
+        };
+        // A valid row has a valid ingest_ts.
+        let rec = ERec { ek, uk, w, ing: ing.unwrap_or(i64::MAX) };
+        if let Some(links) = links {
+            prefetch(links.slot_ptr(uk));
             let slot = out.n % RING;
             if out.n >= RING {
                 let r = out.ring[slot];
@@ -585,7 +650,7 @@ fn build_links(lists: Vec<Vec<(Key, Key)>>) -> KMap {
                 prefetch(map.slot_ptr(pb));
             }
             let mut id = |k: Key| -> u32 {
-                let next = best.len() as u128;
+                let next = best.len() as u64;
                 let (v, slot) = map.get_or_insert_at(k, next);
                 if v == next {
                     best.push(k);
@@ -628,10 +693,22 @@ fn build_links(lists: Vec<Vec<(Key, Key)>>) -> KMap {
 
 // ---------------------------------------------------------------- dedup
 
+/// Exact (ingest_ts, PRec) of a dedup record.
+#[inline(always)]
+fn d_exact(x: u64, cx: &Ctx, overs: &[Over]) -> (i64, *mut PRec) {
+    let code = x >> PTR_BITS;
+    if code != ING_ESC {
+        (cx.ibase + code as i64, ((x & PTR_MASK) << 4) as usize as *mut PRec)
+    } else {
+        let (ing, addr) = overs[((x >> 32) & 0x7FF) as usize][(x & 0xFFFF_FFFF) as usize];
+        (ing, addr as *mut PRec)
+    }
+}
+
 /// Dedup one event partition on event_id: the copy with the smallest
 /// ingest_ts wins (before validation), every other copy that is a valid event
 /// is struck out where it sits in its person partition.
-fn dedup_partition(chunks: &[(*mut DRec, usize)], tbl: &mut Vec<u64>) {
+fn dedup_partition(chunks: &[(*mut DRec, usize)], tbl: &mut Vec<u64>, cx: &Ctx, overs: &[Over]) {
     if chunks.is_empty() {
         return;
     }
@@ -660,14 +737,24 @@ fn dedup_partition(chunks: &[(*mut DRec, usize)], tbl: &mut Vec<u64>) {
                         let og = (v & 0xFFFF_FFFF) as usize - 1;
                         let o = chunks.get_unchecked(og / DCAP).0.add(og % DCAP);
                         if (*o).ek == ek {
-                            let loser = if (*r).ing < (*o).ing {
-                                *tbl.get_unchecked_mut(s) = me;
-                                (*o).ptr
+                            let (rx, ox) = ((*r).x, (*o).x);
+                            let (rc, oc) = (rx >> PTR_BITS, ox >> PTR_BITS);
+                            let (r_wins, rp, op) = if rc != ING_ESC && oc != ING_ESC {
+                                let p = |x: u64| ((x & PTR_MASK) << 4) as usize as *mut PRec;
+                                (rc < oc, p(rx), p(ox))
                             } else {
-                                (*r).ptr
+                                let (ri, rp) = d_exact(rx, cx, overs);
+                                let (oi, op) = d_exact(ox, cx, overs);
+                                (ri < oi, rp, op)
+                            };
+                            let loser = if r_wins {
+                                *tbl.get_unchecked_mut(s) = me;
+                                op
+                            } else {
+                                rp
                             };
                             if !loser.is_null() {
-                                (*loser).ts = INVALID;
+                                (*loser).w = DEAD;
                             }
                             break;
                         }
@@ -845,53 +932,36 @@ fn pack_ev(ts: i64, price: u32, cat: u32) -> u128 {
     (((ts as u64 ^ (1 << 63)) as u128) << 64) | ((price as u128) << 32) | cat as u128
 }
 
-#[inline(always)]
-fn ev_ts(v: u128) -> i64 {
-    ((v >> 64) as u64 ^ (1 << 63)) as i64
-}
-
 /// An event as the sessionizer sorts it: ordered by `ts`.
 trait Ev: Copy + Ord {
-    fn ts(self, ws: i64) -> i64;
+    fn ts(self, cx: &Ctx) -> i64;
     /// (price, category) of a purchase; price 0 for a view or a cart.
-    fn buy(self, side: &[[u32; 2]]) -> (u32, u32);
+    fn buy(self, cx: &Ctx) -> (u32, u32);
 }
 
 /// Wide form, good for anything: ts, price and category side by side.
 impl Ev for u128 {
     #[inline(always)]
-    fn ts(self, _ws: i64) -> i64 {
-        ev_ts(self)
+    fn ts(self, _cx: &Ctx) -> i64 {
+        ((self >> 64) as u64 ^ (1 << 63)) as i64
     }
     #[inline(always)]
-    fn buy(self, _side: &[[u32; 2]]) -> (u32, u32) {
+    fn buy(self, _cx: &Ctx) -> (u32, u32) {
         ((self >> 32) as u32, self as u32)
     }
 }
 
-/// Narrow form, half the bytes to move and sort: `(ts - window_start) << 24`
-/// with, for a purchase, its number + 1 in the partition's purchase list in
-/// the low 24 bits. Used when the window is under 2^40 ms and the partition
-/// has fewer than 2^24 purchases.
+/// Narrow form: the `w` of a `PRec` as it is.
 impl Ev for u64 {
     #[inline(always)]
-    fn ts(self, ws: i64) -> i64 {
-        ws + (self >> NARROW_SHIFT) as i64
+    fn ts(self, cx: &Ctx) -> i64 {
+        cx.ws + (self >> cx.ts_shift) as i64
     }
     #[inline(always)]
-    fn buy(self, side: &[[u32; 2]]) -> (u32, u32) {
-        let i = (self & NARROW_MASK) as usize;
-        if i == 0 {
-            (0, 0)
-        } else {
-            let p = side[i - 1];
-            (p[0], p[1])
-        }
+    fn buy(self, cx: &Ctx) -> (u32, u32) {
+        (((self >> cx.cat_bits) & PRICE_MASK) as u32, (self & ((1 << cx.cat_bits) - 1)) as u32)
     }
 }
-
-const NARROW_SHIFT: u32 = 24;
-const NARROW_MASK: u64 = (1 << NARROW_SHIFT) - 1;
 
 /// Per-thread state of the sessionize stage.
 struct Sess {
@@ -903,14 +973,15 @@ struct Sess {
     cids: Vec<u32>,
     evs: Vec<u128>,
     evs64: Vec<u64>,
-    /// (price, category) of the partition's purchases, for the narrow form
-    purch: Vec<[u32; 2]>,
     cls: Vec<Clk>,
     echunks: Vec<(*mut PRec, usize)>,
     cchunks: Vec<(*mut CRec, usize)>,
-    /// the person being processed, and its name if the key is a long one
+    /// the person being processed and its name: in `name` if the key is an
+    /// interned one, else in the first `nlen` bytes of `nbuf`
     person: Key,
     name: Vec<u8>,
+    nbuf: [u8; 16],
+    nlen: usize,
     catsum: Vec<u64>,
     touched: Vec<u32>,
     ccount: Vec<u32>,
@@ -936,12 +1007,13 @@ impl Sess {
             cids: Vec::new(),
             evs: Vec::new(),
             evs64: Vec::new(),
-            purch: Vec::new(),
             cls: Vec::new(),
             echunks: Vec::new(),
             cchunks: Vec::new(),
             person: 0,
             name: Vec::new(),
+            nbuf: [0; 16],
+            nlen: 0,
             catsum: vec![0; cx.cats.len()],
             touched: Vec::new(),
             ccount: vec![0; ncamp],
@@ -955,7 +1027,7 @@ impl Sess {
     }
 
     /// Group one person partition by person, then process each person.
-    fn partition(&mut self, cx: &Ctx, ebs: &[Buckets<PRec>], cbs: &[Buckets<CRec>], p: usize) {
+    fn partition(&mut self, cx: &Ctx, ebs: &[Buckets<PRec>], cbs: &[Buckets<CRec>], sides: &[Side], p: usize) {
         all_chunks(ebs, p, &mut self.echunks);
         // Upper bound: it still counts the events the dedup struck out.
         let total: usize = self.echunks.iter().map(|c| c.1).sum();
@@ -974,15 +1046,13 @@ impl Sess {
         unsafe {
             // Pass 1: number the persons, count their events.
             let mut n = 0usize;
-            let mut npurch = 0usize;
             for &(ptr, len) in &self.echunks {
                 for i in 0..len {
-                    if (*ptr.add(i)).ts == INVALID {
+                    if (*ptr.add(i)).w == DEAD {
                         self.eids.push(u32::MAX);
                         continue;
                     }
                     n += 1;
-                    npurch += ((*ptr.add(i)).price != 0) as usize;
                     let person = (*ptr.add(i)).person;
                     let mut s = hash(person) as usize & mask;
                     let id = loop {
@@ -1013,10 +1083,9 @@ impl Sess {
             }
             self.eoff.push(acc);
             // Pass 2: scatter the events to their person's run.
-            let narrow = cx.narrow && npurch < NARROW_MASK as usize;
+            let narrow = cx.narrow;
             self.evs.clear();
             self.evs64.clear();
-            self.purch.clear();
             if narrow {
                 self.evs64.resize(n, 0);
             } else {
@@ -1033,14 +1102,10 @@ impl Sess {
                     }
                     let o = self.eoff.get_unchecked_mut(id);
                     if narrow {
-                        let mut v = ((r.ts - cx.ws) as u64) << NARROW_SHIFT;
-                        if r.price != 0 {
-                            self.purch.push([r.price, r.cat]);
-                            v |= self.purch.len() as u64;
-                        }
-                        *self.evs64.get_unchecked_mut(*o as usize) = v;
+                        *self.evs64.get_unchecked_mut(*o as usize) = r.w;
                     } else {
-                        *self.evs.get_unchecked_mut(*o as usize) = pack_ev(r.ts, r.price, r.cat);
+                        let (ts, price, cat) = sides[(r.w >> SIDE_BITS) as usize][(r.w & ((1 << SIDE_BITS) - 1)) as usize];
+                        *self.evs.get_unchecked_mut(*o as usize) = pack_ev(ts, price, cat);
                     }
                     *o += 1;
                 }
@@ -1095,7 +1160,6 @@ impl Sess {
             // Both offset arrays now hold run ends.
             let mut evs = std::mem::take(&mut self.evs);
             let mut evs64 = std::mem::take(&mut self.evs64);
-            let purch = std::mem::take(&mut self.purch);
             let mut cls = std::mem::take(&mut self.cls);
             let (mut e0, mut c0) = (0usize, 0usize);
             for id in 0..np {
@@ -1103,16 +1167,15 @@ impl Sess {
                 let c1 = self.coff[id] as usize;
                 let person = self.persons[id];
                 if narrow {
-                    self.person(cx, person, &mut evs64[e0..e1], &purch, &mut cls[c0..c1]);
+                    self.person(cx, person, &mut evs64[e0..e1], &mut cls[c0..c1]);
                 } else {
-                    self.person(cx, person, &mut evs[e0..e1], &purch, &mut cls[c0..c1]);
+                    self.person(cx, person, &mut evs[e0..e1], &mut cls[c0..c1]);
                 }
                 e0 = e1;
                 c0 = c1;
             }
             self.evs = evs;
             self.evs64 = evs64;
-            self.purch = purch;
             self.cls = cls;
         }
         if self.out.day.len() >= ROW_GROUP_ROWS {
@@ -1122,7 +1185,7 @@ impl Sess {
 
     /// Sessionize one person's events, credit and assist each session, and
     /// emit the person's user_daily rows.
-    fn person<E: Ev>(&mut self, cx: &Ctx, person: Key, evs: &mut [E], side: &[[u32; 2]], cls: &mut [Clk]) {
+    fn person<E: Ev>(&mut self, cx: &Ctx, person: Key, evs: &mut [E], cls: &mut [Clk]) {
         if evs.len() > 1 {
             evs.sort_unstable();
         }
@@ -1134,6 +1197,8 @@ impl Sess {
         if is_long(person) {
             self.name.clear();
             key_bytes(person, &mut self.name);
+        } else {
+            self.nlen = compact_bytes(person, &mut self.nbuf);
         }
 
         let n = evs.len();
@@ -1148,7 +1213,7 @@ impl Sess {
         let (mut lo, mut hi) = (0usize, 0usize);
         let (mut grp_ck, mut grp_camp): (Key, u32) = (0, 0);
         while i < n {
-            let start = evs[i].ts(cx.ws);
+            let start = evs[i].ts(cx);
             let day = start.div_euclid(DAY_MS) as i32;
             if day != row_day {
                 if row_day != i32::MIN {
@@ -1165,13 +1230,13 @@ impl Sess {
             let mut revenue = 0u64;
             while i < n {
                 let v = evs[i];
-                let t = v.ts(cx.ws);
+                let t = v.ts(cx);
                 if t - prev > GAP_MS {
                     break;
                 }
                 prev = t;
                 count += 1;
-                let (price, cat) = v.buy(side);
+                let (price, cat) = v.buy(cx);
                 if price != 0 {
                     let cat = cat as usize;
                     revenue += price as u64;
@@ -1266,9 +1331,9 @@ impl Sess {
         if is_long(self.person) {
             put_str(&mut o.ids, &self.name);
         } else {
-            // A short ID sits in the key itself: copy all 16 bytes at a fixed
-            // size and keep the first `len` (no variable-length memcpy).
-            let len = (self.person as u8) as usize;
+            // A short name: copy all 16 bytes of its buffer at a fixed size
+            // and keep the first `len` (no variable-length memcpy).
+            let len = self.nlen;
             let at = o.ids.len();
             o.ids.reserve(20);
             // SAFETY: 20 bytes are reserved past `at`; 4 + len <= 19 of them
@@ -1276,7 +1341,7 @@ impl Sess {
             unsafe {
                 let p = o.ids.as_mut_ptr().add(at);
                 std::ptr::copy_nonoverlapping((len as u32).to_le_bytes().as_ptr(), p, 4);
-                std::ptr::copy_nonoverlapping(self.person.to_be_bytes().as_ptr(), p.add(4), 16);
+                std::ptr::copy_nonoverlapping(self.nbuf.as_ptr(), p.add(4), 16);
                 o.ids.set_len(at + 4 + len);
             }
         }
@@ -1350,7 +1415,7 @@ fn main() {
         if id.is_empty() {
             continue;
         }
-        let next = camp_ids.len() as u128;
+        let next = camp_ids.len() as u64;
         if campaigns.get_or_insert(make_key(id, 0, id.len()), next) == next {
             camp_ids.push(id.clone());
             camp_channels.push(ch.clone());
@@ -1375,6 +1440,12 @@ fn main() {
     let pe_bits = env_usize("SS_PE_BITS").map_or(bits_for(24_000, 11), |b| b as u32);
     let pp_bits = env_usize("SS_PP_BITS").map_or(bits_for(32_000, 11), |b| b as u32);
 
+    // Bits for a category number and for `ts - window_start` (see `PRec`).
+    let cat_bits = (usize::BITS - (cats.len().max(2) - 1).leading_zeros()).max(1);
+    let ts_bits = match we.checked_sub(ws) {
+        Some(d) if d >= 0 => 64 - (d as u64).leading_zeros(),
+        _ => 64,
+    };
     let cx = Ctx {
         ws,
         we,
@@ -1387,7 +1458,15 @@ fn main() {
         camp_channels,
         pe_bits,
         pp_bits,
-        narrow: we.checked_sub(ws).map_or(false, |d| d >= 0 && d <= 1 << 40) && std::env::var_os("SS_WIDE").is_none(),
+        narrow: ts_bits + PRICE_BITS + cat_bits <= 64 && std::env::var_os("SS_WIDE").is_none(),
+        ts_shift: PRICE_BITS + cat_bits,
+        cat_bits,
+        // SS_IBASE (testing) moves the base by that many seconds, so that
+        // some or all rows take the overflow path.
+        ibase: ws
+            .div_euclid(1000)
+            .saturating_sub(86_400)
+            .saturating_add(std::env::var("SS_IBASE").ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0)),
         out_dir,
     };
     let cx = &cx;
@@ -1425,8 +1504,8 @@ fn main() {
                 eprintln!("{:>8.1} ms  (links joined)", t0.elapsed().as_secs_f64() * 1e3);
             }
         });
-        par_map(nt, |_| {
-            let mut out = EvOut::new(cx);
+        par_map(nt, |t| {
+            let mut out = EvOut::new(cx, t);
             loop {
                 let i = next.fetch_add(1, Relaxed);
                 if i >= echunks.len() {
@@ -1450,10 +1529,15 @@ fn main() {
     let links = link_cell.get().unwrap();
     let mut dbuckets = Vec::with_capacity(eouts.len());
     let mut pbuckets = Vec::with_capacity(eouts.len());
+    let mut overs: Vec<Over> = Vec::with_capacity(eouts.len());
+    let mut sides: Vec<Side> = Vec::with_capacity(eouts.len());
     for o in eouts {
         dbuckets.push(o.d);
         pbuckets.push(o.p);
+        overs.push(o.over);
+        sides.push(o.side);
     }
+    let (overs, sides) = (&overs, &sides);
     lap("events parsed, links joined");
 
     // ---- clicks: parse, validate, resolve the person, scatter by person
@@ -1487,7 +1571,7 @@ fn main() {
                 break;
             }
             all_chunks(dbuckets, p, &mut chunks);
-            dedup_partition(&chunks, &mut tbl);
+            dedup_partition(&chunks, &mut tbl, cx, overs);
         }
     });
     lap("events deduped");
@@ -1511,7 +1595,7 @@ fn main() {
             if i >= order.len() {
                 break;
             }
-            st.partition(cx, pbuckets, cbuckets, order[i].1 as usize);
+            st.partition(cx, pbuckets, cbuckets, sides, order[i].1 as usize);
         }
         st.out.finish(t == 0);
         st.agg

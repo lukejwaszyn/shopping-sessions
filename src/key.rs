@@ -1,22 +1,26 @@
-//! Exact fixed-width string keys.
+//! Exact 64-bit string keys.
 //!
-//! Every ID (event, click, user, product, campaign) is turned into a `u128`
+//! Every ID (event, click, user, product, campaign) is turned into a `u64`
 //! that represents the string *exactly*, so equality on keys is equality on
 //! strings and no hash is ever trusted for identity.
 //!
-//! * 1..=15 bytes: the bytes sit big-endian in the top 15 bytes and the length
-//!   in the low byte. Integer order on two such keys is byte-wise string order.
-//! * 16+ bytes: the string is interned in a global table and the key is
-//!   `index << 8 | 0xFF`. The generator never produces these; the path exists
-//!   only so that arbitrary input stays exact.
+//! * Compact: a string of 1..=10 bytes, all from `0-9 A-Z _ a-z`, is written
+//!   as one 6-bit code per byte (1..=63, in byte order), first byte in the top
+//!   bits, unused codes zero, and the low 4 bits zero. No code is zero, so the
+//!   codes alone identify the string, and integer order on two compact keys is
+//!   byte-wise string order. Every ID the generator makes is of this kind.
+//! * Interned: any other string is stored in a global table and its key is
+//!   `index << 4 | 0xF`. This path is slow and exists so that arbitrary input
+//!   stays exact.
 //!
-//! Key 0 is never produced (the length byte is non-zero) and marks empty slots.
+//! Key 0 is never produced (a field is never empty here) and marks empty
+//! slots.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-pub type Key = u128;
+pub type Key = u64;
 
 struct LongTab {
     map: HashMap<Vec<u8>, u64>,
@@ -25,16 +29,35 @@ struct LongTab {
 
 static LONG: Mutex<Option<LongTab>> = Mutex::new(None);
 
-const fn masks() -> [u128; 16] {
-    let mut m = [0u128; 16];
+/// Longest string a compact key holds.
+pub const COMPACT_MAX: usize = 10;
+const INVALID: u8 = 0x80;
+
+/// The alphabet in byte order; code = index + 1.
+const ALPHA: &[u8; 63] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+
+const fn code_table() -> [u8; 256] {
+    let mut t = [INVALID; 256];
     let mut i = 0;
-    while i < 16 {
-        m[i] = (1u128 << (8 * i)) - 1;
+    while i < 63 {
+        t[ALPHA[i] as usize] = i as u8 + 1;
+        i += 1;
+    }
+    t
+}
+static CODE: [u8; 256] = code_table();
+
+/// `KEEP[len]`: the bits of the first `len` codes.
+const fn keep_table() -> [u64; COMPACT_MAX + 1] {
+    let mut m = [0u64; COMPACT_MAX + 1];
+    let mut i = 1;
+    while i <= COMPACT_MAX {
+        m[i] = !0u64 << (64 - 6 * i);
         i += 1;
     }
     m
 }
-static MASKS: [u128; 16] = masks();
+static KEEP: [u64; COMPACT_MAX + 1] = keep_table();
 
 #[cold]
 #[inline(never)]
@@ -50,7 +73,7 @@ fn long_key(s: &[u8]) -> Key {
             i
         }
     };
-    ((idx as u128) << 8) | 0xFF
+    (idx << 4) | 0xF
 }
 
 /// Key of the non-empty field `buf[s..e]`.
@@ -58,34 +81,69 @@ fn long_key(s: &[u8]) -> Key {
 pub fn make_key(buf: &[u8], s: usize, e: usize) -> Key {
     let len = e - s;
     debug_assert!(len > 0 && e <= buf.len());
-    if len <= 15 {
-        let x = if s + 16 <= buf.len() {
-            // SAFETY: 16 bytes starting at s are inside buf.
-            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(s) as *const u128) }
-        } else {
-            let mut t = [0u8; 16];
-            t[..len].copy_from_slice(&buf[s..e]);
-            u128::from_ne_bytes(t)
-        };
-        (u128::from_le(x) & MASKS[len]).swap_bytes() | len as u128
-    } else {
-        long_key(&buf[s..e])
+    if len > COMPACT_MAX {
+        return long_key(&buf[s..e]);
     }
+    let (lo, hi) = if s + 16 <= buf.len() {
+        // SAFETY: 16 bytes starting at s are inside buf.
+        unsafe {
+            let p = buf.as_ptr().add(s);
+            (
+                u64::from_le(std::ptr::read_unaligned(p as *const u64)),
+                u64::from_le(std::ptr::read_unaligned(p.add(8) as *const u64)),
+            )
+        }
+    } else {
+        let mut t = [0u8; 16];
+        t[..len].copy_from_slice(&buf[s..e]);
+        (u64::from_le_bytes(t[..8].try_into().unwrap()), u64::from_le_bytes(t[8..].try_into().unwrap()))
+    };
+    // All ten positions are coded; those past the field are cut off after.
+    let mut k = 0u64;
+    let mut bad = 0u32;
+    let mut i = 0;
+    while i < COMPACT_MAX {
+        let byte = if i < 8 { (lo >> (8 * i)) as u8 } else { (hi >> (8 * (i - 8))) as u8 };
+        let c = CODE[byte as usize];
+        k |= ((c & 63) as u64) << (58 - 6 * i);
+        bad |= ((c >> 7) as u32) << i;
+        i += 1;
+    }
+    if bad & ((1u32 << len) - 1) != 0 {
+        return long_key(&buf[s..e]);
+    }
+    k & KEEP[len]
 }
 
 #[inline(always)]
 pub fn is_long(k: Key) -> bool {
-    k as u8 == 0xFF
+    k & 0xF != 0
+}
+
+/// Write the string of a compact key to `out`, return its length.
+#[inline(always)]
+pub fn compact_bytes(k: Key, out: &mut [u8; 16]) -> usize {
+    let mut n = 0;
+    while n < COMPACT_MAX {
+        let c = ((k >> (58 - 6 * n)) & 63) as usize;
+        if c == 0 {
+            break;
+        }
+        out[n] = ALPHA[c - 1];
+        n += 1;
+    }
+    n
 }
 
 /// Append the string a key stands for.
 pub fn key_bytes(k: Key, out: &mut Vec<u8>) {
     if !is_long(k) {
-        let len = (k as u8) as usize;
-        out.extend_from_slice(&k.to_be_bytes()[..len]);
+        let mut b = [0u8; 16];
+        let n = compact_bytes(k, &mut b);
+        out.extend_from_slice(&b[..n]);
     } else {
         let g = LONG.lock().unwrap();
-        out.extend_from_slice(&g.as_ref().unwrap().list[(k >> 8) as usize]);
+        out.extend_from_slice(&g.as_ref().unwrap().list[(k >> 4) as usize]);
     }
 }
 
@@ -101,7 +159,7 @@ fn cmp_slow(a: Key, b: Key) -> Ordering {
 /// Byte-wise order of the strings behind two keys.
 #[inline(always)]
 pub fn key_cmp(a: Key, b: Key) -> Ordering {
-    if !is_long(a) && !is_long(b) {
+    if (a | b) & 0xF == 0 {
         a.cmp(&b)
     } else {
         cmp_slow(a, b)
@@ -110,11 +168,8 @@ pub fn key_cmp(a: Key, b: Key) -> Ordering {
 
 #[inline(always)]
 pub fn hash(k: Key) -> u64 {
-    let lo = k as u64;
-    let hi = (k >> 64) as u64;
-    let mut x = hi.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ lo;
-    x = (x ^ (x >> 32)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-    x = (x ^ (x >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let x = k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let x = (x ^ (x >> 32)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
     x ^ (x >> 32)
 }
 
@@ -136,7 +191,7 @@ pub fn prefetch<T>(p: *const T) {
 #[repr(C)]
 pub struct Slot {
     pub k: Key,
-    pub v: u128,
+    pub v: u64,
 }
 
 extern "C" {
@@ -185,7 +240,7 @@ pub fn big_alloc(bytes: usize) -> *mut u8 {
     p
 }
 
-/// Fixed-capacity open-addressing map from exact keys to a 128-bit value.
+/// Fixed-capacity open-addressing map from exact keys to a 64-bit value.
 pub struct KMap {
     slots: *mut Slot,
     mask: usize,
@@ -212,7 +267,7 @@ impl KMap {
     }
 
     #[inline(always)]
-    pub fn get(&self, k: Key) -> Option<u128> {
+    pub fn get(&self, k: Key) -> Option<u64> {
         let mut i = hash(k) as usize & self.mask;
         loop {
             let s = unsafe { &*self.slots.add(i) };
@@ -228,7 +283,7 @@ impl KMap {
 
     /// Like `get_or_insert`, and says which slot holds `k`.
     #[inline(always)]
-    pub fn get_or_insert_at(&mut self, k: Key, v: u128) -> (u128, usize) {
+    pub fn get_or_insert_at(&mut self, k: Key, v: u64) -> (u64, usize) {
         let mut i = hash(k) as usize & self.mask;
         loop {
             let s = unsafe { &mut *self.slots.add(i) };
@@ -246,7 +301,7 @@ impl KMap {
 
     /// Value already stored for `k`, or `v` after storing it.
     #[inline(always)]
-    pub fn get_or_insert(&mut self, k: Key, v: u128) -> u128 {
+    pub fn get_or_insert(&mut self, k: Key, v: u64) -> u64 {
         let mut i = hash(k) as usize & self.mask;
         loop {
             let s = unsafe { &mut *self.slots.add(i) };
@@ -259,6 +314,75 @@ impl KMap {
                 return v;
             }
             i = (i + 1) & self.mask;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_are_exact_and_ordered() {
+        let mut x = 0x1234_5678_9ABC_DEF1u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let pool: &[u8] = b"09AZ_az\0 ,\"-/:@[`{\x7f\x80\xff5Qq^";
+        let mut strs: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..6000 {
+            let len = 1 + (rnd() % 13) as usize;
+            // Mostly alphabet bytes, so that many strings are compact and
+            // many share prefixes.
+            let alpha_only = rnd() % 4 != 0;
+            let s: Vec<u8> = (0..len)
+                .map(|_| {
+                    let r = rnd();
+                    if alpha_only {
+                        ALPHA[((r >> 8) % if r & 1 == 0 { 63 } else { 3 }) as usize]
+                    } else {
+                        pool[(r % pool.len() as u64) as usize]
+                    }
+                })
+                .collect();
+            strs.push(s);
+        }
+        for a in ALPHA.iter() {
+            strs.push(vec![*a]);
+        }
+        for b in 0..=255u8 {
+            strs.push(vec![b]);
+            strs.push(vec![b'a', b]);
+            strs.push(vec![b'a'; 9].into_iter().chain([b]).collect());
+        }
+        let keys: Vec<Key> = strs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                // The field in the middle of a buffer and at its very end.
+                let mut buf = b",,".to_vec();
+                buf.extend_from_slice(s);
+                let k1 = make_key(&buf, 2, 2 + s.len());
+                buf.extend_from_slice(b"\",zzzzzzzzzzzzzzzzzzzzzzzz\n");
+                let k2 = make_key(&buf, 2, 2 + s.len());
+                assert_eq!(k1, k2, "string {}", i);
+                assert_ne!(k1, 0);
+                let compact = s.len() <= COMPACT_MAX && s.iter().all(|c| ALPHA.contains(c));
+                assert_eq!(!is_long(k1), compact);
+                let mut back = Vec::new();
+                key_bytes(k1, &mut back);
+                assert_eq!(&back, s);
+                k1
+            })
+            .collect();
+        for i in 0..strs.len() {
+            for j in (i + 1..strs.len()).step_by(1 + i % 7) {
+                assert_eq!(keys[i] == keys[j], strs[i] == strs[j]);
+                assert_eq!(key_cmp(keys[i], keys[j]), strs[i].cmp(&strs[j]), "{:?} {:?}", strs[i], strs[j]);
+            }
         }
     }
 }
