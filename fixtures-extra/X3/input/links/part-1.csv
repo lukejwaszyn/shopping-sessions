@@ -1,0 +1,7 @@
+user_id_a,user_id_b
+abcdefghijklmnop,abcdefghijklmnopq
+abcdefghijklmnopabcdefghijklmnopabcdefghijklmnop,ABCDEFGHIJKLMNOPQRSTUVWXYZ
+dev,s3
+s3,s3
+,S3
+S3,

@@ -1,0 +1,5 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+e3,u1,2026-10-03T10:20:00Z,2026-10-03T10:20:01Z,cart,p2,x
+e3,"",2026-10-03T10:20:00Z,2026-10-03T10:20:02Z,cart,p2,x
+e4,"u1",1791022800000,2026-10-03T10:20:01Z,purchase,"p9",0250
+"e4",u1,"001791022800000",2026-10-03T10:20:01Z,purchase,p9,"0250"

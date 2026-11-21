@@ -1,0 +1,7 @@
+click_id,user_id,campaign_id,ts
+abcdefghijklmnopq,abcdefghijklmnop,c_2,2026-10-03T09:00:00Z
+abcdefghijklmnop,abcdefghijklmnopabcdefghijklmnopabcdefghijklmnop,c_1,2026-10-03T09:00:00Z
+abcdefghijklmnop!,abcdefghijklmno,c_2,2026-10-03T09:00:00Z
+abcdefghijklmnopabcdefghijklmnopabcdefghijklmnopa,dev,c_2,2026-10-05T08:00:00Z
+abcdefghijklmnopabcdefghijklmnopabcdefghijklmnop,s3,c_1,2026-10-05T08:00:00Z
+k9,s1,c_2,1791190800001

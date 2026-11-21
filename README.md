@@ -78,6 +78,7 @@ Without Docker (needs Rust 1.99 and Python 3.10+ with `polars`):
 
 ```sh
 make native-fixtures
+make native-fixtures-extra   # 5 more hand-written cases, see fixtures-extra/README.md
 make native-run-dev && make check-dev
 ```
 
@@ -105,6 +106,7 @@ organizers' starter and use `polars`.
 - `src/ts.rs` timestamp and number parsing
 - `src/pq.rs` Parquet writer
 - `fixtures/`, `scripts/`, `rules.md` from the organizers' kit
+- `fixtures-extra/` five more hand-written edge cases (CRLF, duplicates, long IDs, leap day, number limits)
 
 ## License
 

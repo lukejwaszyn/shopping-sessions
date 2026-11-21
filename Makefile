@@ -10,7 +10,7 @@ PYTHON ?= python3
 NATIVE = target/release/pipeline
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: build fixtures dev run-dev check-dev native native-fixtures native-run-dev
+.PHONY: build fixtures dev run-dev check-dev native native-fixtures native-fixtures-extra native-run-dev
 
 ## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
 build:
@@ -40,6 +40,10 @@ native:
 ## Without Docker: all fixtures against the native binary
 native-fixtures: native
 	$(PYTHON) scripts/run_fixtures.py $(FIXTURES) -- $(NATIVE)
+
+## Without Docker: the extra hand-written cases in fixtures-extra/
+native-fixtures-extra: native
+	$(PYTHON) scripts/run_fixtures.py fixtures-extra -- $(NATIVE)
 
 ## Without Docker: the dev set through the native binary, timed (then `make check-dev`)
 native-run-dev: native

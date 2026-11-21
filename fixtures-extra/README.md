@@ -1,0 +1,13 @@
+# Extra fixtures
+
+Five more hand-written cases in the layout of `fixtures/` (`input/` + `expected/`), added during differential testing
+against a slow pure-Python reference. The expected rows were checked by hand against `rules.md`. Same window, products
+and campaigns as `fixtures/` unless noted. Run them with `make native-fixtures-extra`.
+
+| Case | Input | Catches |
+| --- | --- | --- |
+| X1 | Every data line in events, clicks and links ends `\r\n`; quoted last fields (`"7"\r`, `""\r`), a line holding only `\r`, a last line with no `\n`, a clicks header ending `\r\n` | `\r` belongs to the last field: views survive, purchases and clicks do not, a quoted last field becomes malformed, and `u2\r`, `u2\r\r` and `u2` are three IDs in links |
+| X2 | `e1` as two identical copies quoted differently, plus malformed, 6-field and empty-`event_id` lines with earlier `ingest_ts`, plus a later valid copy; a header line repeated mid-file; `e2` whose earliest copy has a bad `ts`; `e4` twice with the same instant spelled `1791022800000` and `001791022800000`; click `k1` four times across two files | Only well-formed lines with an `event_id` take part in the dedup; the earliest of those wins even when invalid; repeated headers are ordinary (invalid) rows; duplicate clicks count once |
+| X3 | A link chain over three files joining 15-, 16-, 17- and 48-byte IDs to an upper-case ID no row uses; a shared device `dev` linking `s1`, `s2`, `s3` (but not `S3`); a links file holding only a header without `\n`; clicks at the same millisecond whose IDs are 16 to 49 bytes long and share prefixes | Long IDs stay exact and ordered byte-wise; the person is named by an unused ID; same-`ts` clicks are decided by the smallest `click_id` whatever its length; a click exactly at a session start credits it |
+| X4 | Window 2028-02-20 to 2028-03-05. Events on Feb 29, offsets that move an instant onto or off Feb 29, `2028-02-30`, `2027-02-29`, an event exactly 24 h late and one 24 h + 1 s late, `+23:59` at the window's end; clicks exactly 7 days before a session, 7 days + 1 s before, at `window_start - 7 days` and 1 s before it, and at hour 24 | Leap day arithmetic, offsets across a month end, the late cutoff and both click limits at one-second precision |
+| X5 | F3 values of `2^64 + valid instant`, `2^63`, `0`, a negative number, and 60 leading zeros; prices `10000001`, `2^64 + 1`, `2^32 + 1`, `0`, `000`, and `10000000` behind 40 zeros; two sessions on one day whose purchases tie three categories at 10,000,000 | No integer wrap-around in timestamps or prices; leading zeros of any length; `top_category` is summed over the day's sessions and a three-way tie goes to the byte-wise smallest |

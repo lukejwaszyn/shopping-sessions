@@ -8,3 +8,4 @@ out/
 *.md
 Makefile
 LICENSE
+fixtures-extra/
