@@ -162,6 +162,12 @@ impl<T: Copy> Buckets<T> {
         self.cur[p] = (np, 0);
     }
 
+    /// Number of records in partition `p`.
+    fn len(&self, p: usize) -> usize {
+        let c = self.cur[p];
+        self.full[p].len() * self.cap as usize + if c.0.is_null() { 0 } else { c.1 as usize }
+    }
+
     /// Append partition `p`'s chunks as (pointer, length). Full chunks first.
     fn chunks(&self, p: usize, out: &mut Vec<(*mut T, usize)>) {
         for &c in &self.full[p] {
@@ -286,6 +292,8 @@ struct Ctx {
     camp_channels: Vec<Vec<u8>>,
     pe_bits: u32,
     pp_bits: u32,
+    /// The window is short enough for the narrow event form.
+    narrow: bool,
     out_dir: PathBuf,
 }
 
@@ -795,6 +803,49 @@ fn ev_ts(v: u128) -> i64 {
     ((v >> 64) as u64 ^ (1 << 63)) as i64
 }
 
+/// An event as the sessionizer sorts it: ordered by `ts`.
+trait Ev: Copy + Ord {
+    fn ts(self, ws: i64) -> i64;
+    /// (price, category) of a purchase; price 0 for a view or a cart.
+    fn buy(self, side: &[[u32; 2]]) -> (u32, u32);
+}
+
+/// Wide form, good for anything: ts, price and category side by side.
+impl Ev for u128 {
+    #[inline(always)]
+    fn ts(self, _ws: i64) -> i64 {
+        ev_ts(self)
+    }
+    #[inline(always)]
+    fn buy(self, _side: &[[u32; 2]]) -> (u32, u32) {
+        ((self >> 32) as u32, self as u32)
+    }
+}
+
+/// Narrow form, half the bytes to move and sort: `(ts - window_start) << 24`
+/// with, for a purchase, its number + 1 in the partition's purchase list in
+/// the low 24 bits. Used when the window is under 2^40 ms and the partition
+/// has fewer than 2^24 purchases.
+impl Ev for u64 {
+    #[inline(always)]
+    fn ts(self, ws: i64) -> i64 {
+        ws + (self >> NARROW_SHIFT) as i64
+    }
+    #[inline(always)]
+    fn buy(self, side: &[[u32; 2]]) -> (u32, u32) {
+        let i = (self & NARROW_MASK) as usize;
+        if i == 0 {
+            (0, 0)
+        } else {
+            let p = side[i - 1];
+            (p[0], p[1])
+        }
+    }
+}
+
+const NARROW_SHIFT: u32 = 24;
+const NARROW_MASK: u64 = (1 << NARROW_SHIFT) - 1;
+
 /// Per-thread state of the sessionize stage.
 struct Sess {
     tbl: Vec<u32>,
@@ -804,6 +855,9 @@ struct Sess {
     eids: Vec<u32>,
     cids: Vec<u32>,
     evs: Vec<u128>,
+    evs64: Vec<u64>,
+    /// (price, category) of the partition's purchases, for the narrow form
+    purch: Vec<[u32; 2]>,
     cls: Vec<Clk>,
     echunks: Vec<(*mut PRec, usize)>,
     cchunks: Vec<(*mut CRec, usize)>,
@@ -811,6 +865,9 @@ struct Sess {
     catsum: Vec<u64>,
     touched: Vec<u32>,
     ccount: Vec<u32>,
+    /// For a campaign with clicks in the window: how many of the day's
+    /// sessions came before the first one it assists in its current run.
+    astart: Vec<u32>,
     inlist: Vec<bool>,
     active: Vec<u32>,
     organic: u32,
@@ -829,6 +886,8 @@ impl Sess {
             eids: Vec::new(),
             cids: Vec::new(),
             evs: Vec::new(),
+            evs64: Vec::new(),
+            purch: Vec::new(),
             cls: Vec::new(),
             echunks: Vec::new(),
             cchunks: Vec::new(),
@@ -836,6 +895,7 @@ impl Sess {
             catsum: vec![0; cx.cats.len()],
             touched: Vec::new(),
             ccount: vec![0; ncamp],
+            astart: vec![0; ncamp],
             inlist: vec![false; ncamp],
             active: Vec::new(),
             organic: ncamp as u32,
@@ -864,6 +924,7 @@ impl Sess {
         unsafe {
             // Pass 1: number the persons, count their events.
             let mut n = 0usize;
+            let mut npurch = 0usize;
             for &(ptr, len) in &self.echunks {
                 for i in 0..len {
                     if (*ptr.add(i)).ts == INVALID {
@@ -871,6 +932,7 @@ impl Sess {
                         continue;
                     }
                     n += 1;
+                    npurch += ((*ptr.add(i)).price != 0) as usize;
                     let person = (*ptr.add(i)).person;
                     let mut s = hash(person) as usize & mask;
                     let id = loop {
@@ -901,8 +963,15 @@ impl Sess {
             }
             self.eoff.push(acc);
             // Pass 2: scatter the events to their person's run.
+            let narrow = cx.narrow && npurch < NARROW_MASK as usize;
             self.evs.clear();
-            self.evs.resize(n, 0);
+            self.evs64.clear();
+            self.purch.clear();
+            if narrow {
+                self.evs64.resize(n, 0);
+            } else {
+                self.evs.resize(n, 0);
+            }
             let mut j = 0;
             for &(ptr, len) in &self.echunks {
                 for i in 0..len {
@@ -913,7 +982,16 @@ impl Sess {
                         continue;
                     }
                     let o = self.eoff.get_unchecked_mut(id);
-                    *self.evs.get_unchecked_mut(*o as usize) = pack_ev(r.ts, r.price, r.cat);
+                    if narrow {
+                        let mut v = ((r.ts - cx.ws) as u64) << NARROW_SHIFT;
+                        if r.price != 0 {
+                            self.purch.push([r.price, r.cat]);
+                            v |= self.purch.len() as u64;
+                        }
+                        *self.evs64.get_unchecked_mut(*o as usize) = v;
+                    } else {
+                        *self.evs.get_unchecked_mut(*o as usize) = pack_ev(r.ts, r.price, r.cat);
+                    }
                     *o += 1;
                 }
             }
@@ -966,17 +1044,25 @@ impl Sess {
             }
             // Both offset arrays now hold run ends.
             let mut evs = std::mem::take(&mut self.evs);
+            let mut evs64 = std::mem::take(&mut self.evs64);
+            let purch = std::mem::take(&mut self.purch);
             let mut cls = std::mem::take(&mut self.cls);
             let (mut e0, mut c0) = (0usize, 0usize);
             for id in 0..np {
                 let e1 = self.eoff[id] as usize;
                 let c1 = self.coff[id] as usize;
                 let person = self.persons[id];
-                self.person(cx, person, &mut evs[e0..e1], &mut cls[c0..c1]);
+                if narrow {
+                    self.person(cx, person, &mut evs64[e0..e1], &purch, &mut cls[c0..c1]);
+                } else {
+                    self.person(cx, person, &mut evs[e0..e1], &purch, &mut cls[c0..c1]);
+                }
                 e0 = e1;
                 c0 = c1;
             }
             self.evs = evs;
+            self.evs64 = evs64;
+            self.purch = purch;
             self.cls = cls;
         }
         if self.out.day.len() >= ROW_GROUP_ROWS {
@@ -986,12 +1072,13 @@ impl Sess {
 
     /// Sessionize one person's events, credit and assist each session, and
     /// emit the person's user_daily rows.
-    fn person(&mut self, cx: &Ctx, person: Key, evs: &mut [u128], cls: &mut [Clk]) {
+    fn person<E: Ev>(&mut self, cx: &Ctx, person: Key, evs: &mut [E], side: &[[u32; 2]], cls: &mut [Clk]) {
         if evs.len() > 1 {
             evs.sort_unstable();
         }
         if cls.len() > 1 {
-            cls.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key_cmp(a.ck, b.ck)));
+            // By time only; the smallest click_id of a tie is picked below.
+            cls.sort_unstable_by_key(|c| c.ts);
         }
         self.name.clear();
         key_bytes(person, &mut self.name);
@@ -1003,14 +1090,17 @@ impl Sess {
         let mut row_day = i32::MIN;
         let (mut r_sessions, mut r_events, mut r_revenue) = (0u32, 0u32, 0u64);
         // click window [lo, hi): clicks with start - 7d <= ts <= start;
-        // grp: first click of the latest timestamp group below hi
-        let (mut lo, mut hi, mut grp) = (0usize, 0usize, 0usize);
+        // (grp_ck, grp_camp): the smallest click_id, and its campaign, of the
+        // latest timestamp group below hi
+        let (mut lo, mut hi) = (0usize, 0usize);
+        let (mut grp_ck, mut grp_camp): (Key, u32) = (0, 0);
         while i < n {
-            let start = ev_ts(evs[i]);
+            let start = evs[i].ts(cx.ws);
             let day = start.div_euclid(DAY_MS) as i32;
             if day != row_day {
                 if row_day != i32::MIN {
                     self.emit_row(cx, row_day, r_sessions, r_events, r_revenue);
+                    self.flush_assists(row_day, r_sessions);
                 }
                 row_day = day;
                 r_sessions = 0;
@@ -1022,15 +1112,15 @@ impl Sess {
             let mut revenue = 0u64;
             while i < n {
                 let v = evs[i];
-                let t = ev_ts(v);
+                let t = v.ts(cx.ws);
                 if t - prev > GAP_MS {
                     break;
                 }
                 prev = t;
                 count += 1;
-                let price = (v >> 32) as u32;
+                let (price, cat) = v.buy(side);
                 if price != 0 {
-                    let cat = v as u32 as usize;
+                    let cat = cat as usize;
                     revenue += price as u64;
                     if self.catsum[cat] == 0 {
                         self.touched.push(cat as u32);
@@ -1046,35 +1136,38 @@ impl Sess {
             let mut camp = self.organic;
             if nc != 0 {
                 while hi < nc && cls[hi].ts <= start {
-                    if hi == 0 || cls[hi].ts != cls[hi - 1].ts {
-                        grp = hi;
+                    if hi == 0 || cls[hi].ts != cls[hi - 1].ts || key_cmp(cls[hi].ck, grp_ck) == Ordering::Less {
+                        grp_ck = cls[hi].ck;
+                        grp_camp = cls[hi].camp;
                     }
                     let c = cls[hi].camp as usize;
                     self.ccount[c] += 1;
-                    if !self.inlist[c] {
-                        self.inlist[c] = true;
-                        self.active.push(c as u32);
+                    if self.ccount[c] == 1 {
+                        // The campaign starts assisting with this session.
+                        self.astart[c] = r_sessions - 1;
+                        if !self.inlist[c] {
+                            self.inlist[c] = true;
+                            self.active.push(c as u32);
+                        }
                     }
                     hi += 1;
                 }
                 let limit = start - WEEK_MS;
                 while lo < hi && cls[lo].ts < limit {
-                    self.ccount[cls[lo].camp as usize] -= 1;
+                    let c = cls[lo].camp as usize;
+                    self.ccount[c] -= 1;
+                    if self.ccount[c] == 0 {
+                        // It assisted the day's sessions before this one,
+                        // from the one it started with.
+                        let k = r_sessions - 1 - self.astart[c];
+                        if k > 0 {
+                            self.agg.cell(c as u32, day)[3] += k as u64;
+                        }
+                    }
                     lo += 1;
                 }
                 if hi > lo {
-                    camp = cls[grp].camp;
-                    let mut j = 0;
-                    while j < self.active.len() {
-                        let c = self.active[j];
-                        if self.ccount[c as usize] == 0 {
-                            self.inlist[c as usize] = false;
-                            self.active.swap_remove(j);
-                        } else {
-                            self.agg.cell(c, day)[3] += 1;
-                            j += 1;
-                        }
-                    }
+                    camp = grp_camp;
                 }
             }
             let cell = self.agg.cell(camp, day);
@@ -1084,10 +1177,34 @@ impl Sess {
         }
         if row_day != i32::MIN {
             self.emit_row(cx, row_day, r_sessions, r_events, r_revenue);
+            self.flush_assists(row_day, r_sessions);
         }
         for c in self.active.drain(..) {
             self.ccount[c as usize] = 0;
             self.inlist[c as usize] = false;
+        }
+    }
+
+    /// A day of the person is over after `sessions` sessions: book the
+    /// sessions each still active campaign assisted, and start them afresh
+    /// for the next day. An assisted session is not booked one at a time: a
+    /// campaign's clicks cover a run of consecutive sessions, booked when the
+    /// run or the day ends.
+    fn flush_assists(&mut self, day: i32, sessions: u32) {
+        let mut j = 0;
+        while j < self.active.len() {
+            let c = self.active[j] as usize;
+            if self.ccount[c] == 0 {
+                self.inlist[c] = false;
+                self.active.swap_remove(j);
+            } else {
+                let k = sessions - self.astart[c];
+                if k > 0 {
+                    self.agg.cell(c as u32, day)[3] += k as u64;
+                }
+                self.astart[c] = 0;
+                j += 1;
+            }
         }
     }
 
@@ -1209,6 +1326,7 @@ fn main() {
         camp_channels,
         pe_bits,
         pp_bits,
+        narrow: we.checked_sub(ws).map_or(false, |d| d >= 0 && d <= 1 << 40) && std::env::var_os("SS_WIDE").is_none(),
         out_dir,
     };
     let cx = &cx;
@@ -1317,14 +1435,22 @@ fn main() {
     // user_daily file
     let next = AtomicUsize::new(0);
     let (pbuckets, cbuckets) = (&pbuckets, &cbuckets);
+    // Biggest partitions first, so that one holding a huge person does not
+    // end up alone at the tail.
+    let mut order: Vec<(usize, u32)> = (0..1usize << cx.pp_bits)
+        .map(|p| (pbuckets.iter().map(|b| b.len(p)).sum::<usize>(), p as u32))
+        .filter(|x| x.0 > 0)
+        .collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
+    let order = &order;
     let aggs: Vec<Agg> = par_map(nt, |t| {
         let mut st = Sess::new(cx, t);
         loop {
-            let p = next.fetch_add(1, Relaxed);
-            if p >= 1 << cx.pp_bits {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= order.len() {
                 break;
             }
-            st.partition(cx, pbuckets, cbuckets, p);
+            st.partition(cx, pbuckets, cbuckets, order[i].1 as usize);
         }
         st.out.finish(t == 0);
         st.agg

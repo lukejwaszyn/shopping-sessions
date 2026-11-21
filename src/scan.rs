@@ -143,38 +143,32 @@ impl<'a> Scanner<'a> {
 
 /// Split a line into exactly `N` fields with surrounding quotes removed.
 /// Returns false when the line is malformed: wrong field count, or a quote
-/// anywhere except around a whole field.
+/// anywhere except around a whole field. Branch-free per field: which fields
+/// are quoted is random, so a branch on it would be mispredicted all the time.
 #[inline(always)]
 pub fn fields<const N: usize>(buf: &[u8], l: &Line, pos: &[usize; 8], f: &mut [(usize, usize); N]) -> bool {
     if l.n != N - 1 {
         return false;
     }
+    // A line exists, so the buffer is not empty.
+    let top = buf.len() - 1;
     let mut s = l.start;
-    if l.qc == 0 {
-        for i in 0..N {
-            let e = if i < N - 1 { pos[i] } else { l.end };
-            f[i] = (s, e);
-            s = e + 1;
-        }
-        return true;
-    }
     let mut nq = 0u32;
+    let mut bad = false;
     for i in 0..N {
         let e = if i < N - 1 { pos[i] } else { l.end };
-        let (mut a, mut b) = (s, e);
-        if a < b && buf[a] == b'"' {
-            if b - a >= 2 && buf[b - 1] == b'"' {
-                a += 1;
-                b -= 1;
-                nq += 1;
-            } else {
-                return false;
-            }
-        }
-        f[i] = (a, b);
+        // SAFETY: both indices are clamped into the buffer; a clamped read is
+        // only ever used when it was in range anyway (s < e <= buf.len()).
+        let first = unsafe { *buf.get_unchecked(s.min(top)) };
+        let last = unsafe { *buf.get_unchecked(e.wrapping_sub(1).min(top)) };
+        let q = (s < e) & (first == b'"');
+        // An opening quote needs its closing quote: at least two bytes.
+        bad |= q & !((e - s >= 2) & (last == b'"'));
+        f[i] = (s + q as usize, e - q as usize);
+        nq += q as u32;
         s = e + 1;
     }
-    l.qc == 2 * nq
+    !bad & (l.qc == 2 * nq)
 }
 
 /// Turn a raw byte range of a file into the range of whole lines that start
