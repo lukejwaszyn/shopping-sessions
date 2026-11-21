@@ -5,7 +5,7 @@ mod pq;
 mod scan;
 mod ts;
 
-use key::{big_alloc, hash, key_bytes, key_cmp, make_key, map_ro, prefetch, KMap, Key};
+use key::{big_alloc, hash, is_long, key_bytes, key_cmp, make_key, map_ro, prefetch, KMap, Key};
 use pq::{Col, ColDef, Ty, Writer};
 use scan::{chunk_bounds, fields, Scanner};
 use std::cmp::Ordering;
@@ -908,6 +908,8 @@ struct Sess {
     cls: Vec<Clk>,
     echunks: Vec<(*mut PRec, usize)>,
     cchunks: Vec<(*mut CRec, usize)>,
+    /// the person being processed, and its name if the key is a long one
+    person: Key,
     name: Vec<u8>,
     catsum: Vec<u64>,
     touched: Vec<u32>,
@@ -938,6 +940,7 @@ impl Sess {
             cls: Vec::new(),
             echunks: Vec::new(),
             cchunks: Vec::new(),
+            person: 0,
             name: Vec::new(),
             catsum: vec![0; cx.cats.len()],
             touched: Vec::new(),
@@ -1127,8 +1130,11 @@ impl Sess {
             // By time only; the smallest click_id of a tie is picked below.
             cls.sort_unstable_by_key(|c| c.ts);
         }
-        self.name.clear();
-        key_bytes(person, &mut self.name);
+        self.person = person;
+        if is_long(person) {
+            self.name.clear();
+            key_bytes(person, &mut self.name);
+        }
 
         let n = evs.len();
         let nc = cls.len();
@@ -1257,7 +1263,23 @@ impl Sess {
 
     fn emit_row(&mut self, cx: &Ctx, day: i32, sessions: u32, events: u32, revenue: u64) {
         let o = &mut self.out;
-        put_str(&mut o.ids, &self.name);
+        if is_long(self.person) {
+            put_str(&mut o.ids, &self.name);
+        } else {
+            // A short ID sits in the key itself: copy all 16 bytes at a fixed
+            // size and keep the first `len` (no variable-length memcpy).
+            let len = (self.person as u8) as usize;
+            let at = o.ids.len();
+            o.ids.reserve(20);
+            // SAFETY: 20 bytes are reserved past `at`; 4 + len <= 19 of them
+            // become part of the vector, all written here.
+            unsafe {
+                let p = o.ids.as_mut_ptr().add(at);
+                std::ptr::copy_nonoverlapping((len as u32).to_le_bytes().as_ptr(), p, 4);
+                std::ptr::copy_nonoverlapping(self.person.to_be_bytes().as_ptr(), p.add(4), 16);
+                o.ids.set_len(at + 4 + len);
+            }
+        }
         o.day.push(day);
         o.sessions.push(sessions as i32);
         o.events.push(events as i32);

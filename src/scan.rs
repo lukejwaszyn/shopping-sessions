@@ -186,3 +186,71 @@ pub fn chunk_bounds(buf: &[u8], raw_s: usize, raw_e: usize) -> (usize, usize) {
     let e = if raw_e >= buf.len() { buf.len() } else { after_nl(raw_e - 1) };
     (s, e.max(s))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Byte-by-byte reference: (start, end, commas, quotes, first 8 commas).
+    fn reference(buf: &[u8]) -> Vec<(usize, usize, usize, u64, Vec<usize>)> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < buf.len() {
+            let end = buf[start..].iter().position(|&b| b == b'\n').map_or(buf.len(), |i| start + i);
+            let line = &buf[start..end];
+            let commas: Vec<usize> = (0..line.len()).filter(|&i| line[i] == b',').map(|i| start + i).collect();
+            let quotes = line.iter().filter(|&&b| b == b'"').count() as u64;
+            out.push((start, end, commas.len(), quotes, commas.into_iter().take(8).collect()));
+            start = end + 1;
+        }
+        out
+    }
+
+    fn scanned(buf: &[u8]) -> Vec<(usize, usize, usize, u64, Vec<usize>)> {
+        let mut sc = Scanner::new(buf);
+        let mut pos = [0usize; 8];
+        let mut out = Vec::new();
+        while let Some(l) = sc.next(&mut pos) {
+            out.push((l.start, l.end, l.n, l.qc as u64, pos[..l.n.min(8)].to_vec()));
+        }
+        out
+    }
+
+    #[test]
+    fn scanner_matches_reference() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for case in 0..20_000 {
+            // Mixes of mostly-delimiter and mostly-text buffers, short and
+            // long, so that lines span blocks and refills in every way.
+            let len = match case % 4 {
+                0 => rnd() % 70,
+                1 => rnd() % 300,
+                2 => rnd() % 3000,
+                _ => rnd() % 9000,
+            } as usize;
+            let dense = rnd() % 5;
+            let nl_rate = [3u64, 12, 80, 700, 5000][(rnd() % 5) as usize];
+            let buf: Vec<u8> = (0..len)
+                .map(|_| {
+                    let r = rnd();
+                    if r % nl_rate == 0 {
+                        b'\n'
+                    } else {
+                        match (r >> 20) % (2 + 6 * dense) {
+                            0 => b',',
+                            1 => b'"',
+                            _ => b'a' + ((r >> 40) % 26) as u8,
+                        }
+                    }
+                })
+                .collect();
+            assert_eq!(scanned(&buf), reference(&buf), "case {} len {}", case, len);
+        }
+    }
+}
