@@ -284,7 +284,31 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     #[cfg(target_os = "linux")]
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    #[cfg(not(target_os = "linux"))]
+    fn munmap(addr: *mut u8, len: usize) -> i32;
 }
+
+/// Give the pages of `[ptr, ptr + len)` back to the kernel now, from the
+/// calling thread: what is still mapped when the process exits is torn down
+/// by one thread, page by page, and that time counts. `ptr` is page-aligned,
+/// the range is whole pages of one mapping, and it is never touched again.
+pub fn release(ptr: *mut u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // MADV_DONTNEED drops the pages and keeps the mapping, under the shared
+    // lock; elsewhere the range is unmapped.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        madvise(ptr, len, 4);
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        munmap(ptr, len);
+    }
+}
+
+pub const HUGE: usize = 2 << 20;
 
 /// Map a whole file read-only. `None` if the kernel refuses.
 pub fn map_ro(fd: i32, len: usize) -> Option<*const u8> {
@@ -297,11 +321,11 @@ pub fn map_ro(fd: i32, len: usize) -> Option<*const u8> {
     }
 }
 
-/// Zeroed memory that is never freed, committed lazily. On Linux it is
-/// aligned to 2 MB and advised for transparent huge pages, which cuts page
+/// Zeroed memory, committed lazily: `bytes` rounded up to a multiple of 2 MB
+/// and aligned to 2 MB. It is never freed, only handed to `release` when done
+/// with. On Linux it is advised for transparent huge pages, which cuts page
 /// faults and TLB misses for the scatter buffers and the link map.
 pub fn big_alloc(bytes: usize) -> *mut u8 {
-    const HUGE: usize = 2 << 20;
     let len = (bytes.max(1) + HUGE - 1) & !(HUGE - 1);
     // MAP_PRIVATE | MAP_ANONYMOUS
     #[cfg(target_os = "linux")]
@@ -318,7 +342,7 @@ pub fn big_alloc(bytes: usize) -> *mut u8 {
         }
         return a;
     }
-    let layout = std::alloc::Layout::from_size_align(bytes.max(1), 4096).unwrap();
+    let layout = std::alloc::Layout::from_size_align(len, HUGE).unwrap();
     let p = unsafe { std::alloc::alloc_zeroed(layout) };
     if p.is_null() {
         std::alloc::handle_alloc_error(layout);
@@ -404,6 +428,12 @@ impl BMap {
         let nb = (max / 2 + 2).next_power_of_two();
         let b = big_alloc(nb * std::mem::size_of::<Bucket>()) as *mut Bucket;
         BMap { b, mask: nb - 1 }
+    }
+
+    /// The memory of the map, for `release`.
+    pub fn region(&self) -> (*mut u8, usize) {
+        let bytes = (self.mask + 1) * std::mem::size_of::<Bucket>();
+        (self.b as *mut u8, (bytes + HUGE - 1) & !(HUGE - 1))
     }
 
     /// Where the lookup of `k` starts, for prefetching.

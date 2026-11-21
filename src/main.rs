@@ -5,7 +5,7 @@ mod pq;
 mod scan;
 mod ts;
 
-use key::{big_alloc, compact_bytes, hash, is_long, key_bytes, key_cmp, make_key, map_ro, prefetch, BMap, KMap, Key};
+use key::{big_alloc, compact_bytes, hash, is_long, key_bytes, key_cmp, make_key, map_ro, prefetch, release, BMap, KMap, Key, HUGE};
 use pq::{Col, ColDef, Ty, Writer};
 use scan::{chunk_bounds, fields, Scanner};
 use std::cmp::Ordering;
@@ -106,19 +106,23 @@ const CCAP: usize = 128;
 
 const SLAB: usize = 8 << 20;
 
-/// Bump allocator. Memory is never returned: the process exits when done.
+/// Bump allocator. Nothing is freed one by one; the slabs are released as a
+/// whole when the stage that reads them is over.
 struct Arena {
     ptr: *mut u8,
     left: usize,
+    /// (address, bytes) of every slab
+    slabs: Vec<(usize, usize)>,
 }
 
 impl Arena {
     fn alloc(&mut self, bytes: usize) -> *mut u8 {
         let bytes = (bytes + 15) & !15;
         if bytes > self.left {
-            let sz = SLAB.max(bytes);
+            let sz = (SLAB.max(bytes) + HUGE - 1) & !(HUGE - 1);
             self.ptr = big_alloc(sz);
             self.left = sz;
+            self.slabs.push((self.ptr as usize, sz));
         }
         let p = self.ptr;
         self.ptr = unsafe { p.add(bytes) };
@@ -145,7 +149,7 @@ impl<T: Copy> Buckets<T> {
             cap: cap as u32,
             cur: vec![(std::ptr::null_mut(), cap as u32); parts],
             full: (0..parts).map(|_| Vec::new()).collect(),
-            arena: Arena { ptr: std::ptr::null_mut(), left: 0 },
+            arena: Arena { ptr: std::ptr::null_mut(), left: 0, slabs: Vec::new() },
         }
     }
 
@@ -201,6 +205,56 @@ impl<T: Copy> Buckets<T> {
     }
 }
 
+/// Memory nobody reads any more, cut into pieces that the threads of a later
+/// stage release when they run out of work (see `key::release`).
+struct Garbage {
+    pieces: Vec<(usize, usize)>,
+    next: AtomicUsize,
+}
+
+impl Garbage {
+    fn new() -> Garbage {
+        Garbage { pieces: Vec::new(), next: AtomicUsize::new(0) }
+    }
+
+    /// `ptr` is page-aligned and the range is whole pages of one mapping.
+    fn add(&mut self, ptr: usize, len: usize) {
+        const PIECE: usize = 16 << 20;
+        let mut off = 0;
+        while off < len {
+            let n = PIECE.min(len - off);
+            self.pieces.push((ptr + off, n));
+            off += n;
+        }
+    }
+
+    fn add_files(&mut self, files: &[MFile]) {
+        for f in files {
+            if f.mapped {
+                self.add(f.ptr as usize, f.len);
+            }
+        }
+    }
+
+    fn add_slabs<T>(&mut self, bs: &[Buckets<T>]) {
+        for b in bs {
+            for &(ptr, len) in &b.arena.slabs {
+                self.add(ptr, len);
+            }
+        }
+    }
+
+    fn drain(&self) {
+        loop {
+            let i = self.next.fetch_add(1, Relaxed);
+            if i >= self.pieces.len() {
+                break;
+            }
+            release(self.pieces[i].0 as *mut u8, self.pieces[i].1);
+        }
+    }
+}
+
 /// Partition `p`'s chunks of all threads.
 fn all_chunks<T: Copy>(bs: &[Buckets<T>], p: usize, out: &mut Vec<(*mut T, usize)>) {
     out.clear();
@@ -219,6 +273,8 @@ fn part(h: u64, bits: u32) -> usize {
 struct MFile {
     ptr: *const u8,
     len: usize,
+    /// memory-mapped, not read into the heap
+    mapped: bool,
 }
 unsafe impl Send for MFile {}
 unsafe impl Sync for MFile {}
@@ -237,10 +293,10 @@ fn map_file(path: &Path) -> Option<MFile> {
         return None;
     }
     match map_ro(f.as_raw_fd(), len) {
-        Some(ptr) => Some(MFile { ptr, len }),
+        Some(ptr) => Some(MFile { ptr, len, mapped: true }),
         None => {
             let v = std::fs::read(path).unwrap().leak();
-            Some(MFile { ptr: v.as_ptr(), len: v.len() })
+            Some(MFile { ptr: v.as_ptr(), len: v.len(), mapped: false })
         }
     }
 }
@@ -701,6 +757,8 @@ fn build_links(lists: Vec<Vec<(Key, Key)>>) -> BMap {
             out.get_or_insert(ids[i], names[i]);
         }
     }
+    let (ptr, len) = map.region();
+    release(ptr, len);
     out
 }
 
@@ -1540,6 +1598,11 @@ fn main() {
         })
     });
     let links = link_cell.get().unwrap();
+    // The event files are done with; the threads of the next stage let go of
+    // them. Each stage does this for what the stage before it read last.
+    let mut garbage = Garbage::new();
+    garbage.add_files(&efiles);
+    let garbage = &garbage;
     let mut dbuckets = Vec::with_capacity(eouts.len());
     let mut pbuckets = Vec::with_capacity(eouts.len());
     let mut overs: Vec<Over> = Vec::with_capacity(eouts.len());
@@ -1568,11 +1631,18 @@ fn main() {
             let (s, e) = chunk_bounds(buf, rs, re);
             parse_clicks(&buf[s..e], cx, links, &mut out);
         }
+        garbage.drain();
         out
     });
     lap("clicks parsed");
 
     // ---- events: dedup per event_id partition
+    let mut garbage = Garbage::new();
+    garbage.add_files(&cfiles);
+    garbage.add_files(&lfiles);
+    let (ptr, len) = links.region();
+    garbage.add(ptr as usize, len);
+    let garbage = &garbage;
     let next = AtomicUsize::new(0);
     let dbuckets = &dbuckets;
     par_map(nt, |_| {
@@ -1586,11 +1656,15 @@ fn main() {
             all_chunks(dbuckets, p, &mut chunks);
             dedup_partition(&chunks, &mut tbl, cx, overs);
         }
+        garbage.drain();
     });
     lap("events deduped");
 
     // ---- sessions: per person partition; each thread writes its own
     // user_daily file
+    let mut garbage = Garbage::new();
+    garbage.add_slabs(dbuckets);
+    let garbage = &garbage;
     let next = AtomicUsize::new(0);
     let (pbuckets, cbuckets) = (&pbuckets, &cbuckets);
     // Biggest partitions first, so that one holding a huge person does not
@@ -1611,11 +1685,30 @@ fn main() {
             st.partition(cx, pbuckets, cbuckets, sides, order[i].1 as usize);
         }
         st.out.finish(t == 0);
+        garbage.drain();
         st.agg
     });
     lap("sessions done, user_daily written");
 
-    // ---- campaign_daily
+    // ---- campaign_daily, while the other threads let go of the events and
+    // clicks
+    let mut garbage = Garbage::new();
+    garbage.add_slabs(pbuckets);
+    garbage.add_slabs(cbuckets);
+    let garbage = &garbage;
+    std::thread::scope(|s| {
+        for _ in 1..nt {
+            s.spawn(move || garbage.drain());
+        }
+        write_campaign_daily(cx, aggs);
+        garbage.drain();
+    });
+    lap("campaign_daily written");
+    // Skip destructors: whatever is left is the kernel's job at exit.
+    std::process::exit(0);
+}
+
+fn write_campaign_daily(cx: &Ctx, aggs: Vec<Agg>) {
     let mut aggs = aggs.into_iter();
     let mut agg = aggs.next().unwrap();
     for a in aggs {
@@ -1653,7 +1746,4 @@ fn main() {
         ],
     );
     w.finish();
-    lap("campaign_daily written");
-    // Skip destructors: unmapping gigabytes is the kernel's job at exit.
-    std::process::exit(0);
 }
