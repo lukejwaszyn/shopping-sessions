@@ -76,6 +76,107 @@ fn long_key(s: &[u8]) -> Key {
     (idx << 4) | 0xF
 }
 
+/// The 6-bit codes of 16 bytes, one per byte (0 for a byte outside the
+/// alphabet), and 0xFF per byte that is in the alphabet; each as two
+/// little-endian halves.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn codes16(b: &[u8; 16]) -> ([u64; 2], [u64; 2]) {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is part of every x86-64 target.
+    unsafe {
+        let v = _mm_loadu_si128(b.as_ptr() as *const __m128i);
+        let c = |x: u8| _mm_set1_epi8(x as i8);
+        // `v - first` as an unsigned byte is at most `span` exactly for the
+        // bytes first..=first + span.
+        let range = |first: u8, span: u8, code: u8| {
+            let d = _mm_sub_epi8(v, c(first));
+            let m = _mm_cmpeq_epi8(_mm_min_epu8(d, c(span)), d);
+            (m, _mm_and_si128(m, _mm_add_epi8(d, c(code))))
+        };
+        let (md, cd) = range(b'0', 9, 1);
+        let (mu, cu) = range(b'A', 25, 11);
+        let (ml, cl) = range(b'a', 25, 38);
+        let ms = _mm_cmpeq_epi8(v, c(b'_'));
+        let cs = _mm_and_si128(ms, c(37));
+        let codes = _mm_or_si128(_mm_or_si128(cd, cu), _mm_or_si128(cl, cs));
+        let valid = _mm_or_si128(_mm_or_si128(md, mu), _mm_or_si128(ml, ms));
+        let halves = |x: __m128i| [_mm_cvtsi128_si64(x) as u64, _mm_cvtsi128_si64(_mm_unpackhi_epi64(x, x)) as u64];
+        (halves(codes), halves(valid))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn codes16(b: &[u8; 16]) -> ([u64; 2], [u64; 2]) {
+    use core::arch::aarch64::*;
+    // SAFETY: NEON is part of every aarch64 target.
+    unsafe {
+        let v = vld1q_u8(b.as_ptr());
+        let range = |first: u8, span: u8, code: u8| {
+            let d = vsubq_u8(v, vdupq_n_u8(first));
+            let m = vcleq_u8(d, vdupq_n_u8(span));
+            (m, vandq_u8(m, vaddq_u8(d, vdupq_n_u8(code))))
+        };
+        let (md, cd) = range(b'0', 9, 1);
+        let (mu, cu) = range(b'A', 25, 11);
+        let (ml, cl) = range(b'a', 25, 38);
+        let ms = vceqq_u8(v, vdupq_n_u8(b'_'));
+        let cs = vandq_u8(ms, vdupq_n_u8(37));
+        let codes = vorrq_u8(vorrq_u8(cd, cu), vorrq_u8(cl, cs));
+        let valid = vorrq_u8(vorrq_u8(md, mu), vorrq_u8(ml, ms));
+        let halves = |x: uint8x16_t| {
+            let x = vreinterpretq_u64_u8(x);
+            [vgetq_lane_u64(x, 0), vgetq_lane_u64(x, 1)]
+        };
+        (halves(codes), halves(valid))
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn codes16(b: &[u8; 16]) -> ([u64; 2], [u64; 2]) {
+    codes16_table(b)
+}
+
+/// `codes16` by table, byte by byte: the reference for the vector versions.
+#[allow(dead_code)]
+fn codes16_table(b: &[u8; 16]) -> ([u64; 2], [u64; 2]) {
+    let (mut codes, mut valid) = ([0u64; 2], [0u64; 2]);
+    for i in 0..16 {
+        let c = CODE[b[i] as usize];
+        if c != INVALID {
+            codes[i / 8] |= (c as u64) << (8 * (i % 8));
+            valid[i / 8] |= 0xFF << (8 * (i % 8));
+        }
+    }
+    (codes, valid)
+}
+
+/// Eight 6-bit codes, one per byte and the first in the lowest byte, packed
+/// into 48 bits with the first code on top.
+#[inline(always)]
+fn pack8(c: u64) -> u64 {
+    const M6: u64 = 0x003F_003F_003F_003F;
+    const M12: u64 = 0x0000_0FFF_0000_0FFF;
+    let t = ((c & M6) << 6) | ((c >> 8) & M6);
+    let t = ((t & M12) << 12) | ((t >> 16) & M12);
+    ((t & 0xFF_FFFF) << 24) | (t >> 32)
+}
+
+/// `BYTES[len]`: 0xFF in the first `len` bytes of 16, as two halves.
+const fn bytes_table() -> [[u64; 2]; COMPACT_MAX + 1] {
+    let mut m = [[0u64; 2]; COMPACT_MAX + 1];
+    let mut i = 1;
+    while i <= COMPACT_MAX {
+        m[i][0] = if i >= 8 { !0 } else { (1u64 << (8 * i)) - 1 };
+        m[i][1] = if i > 8 { (1u64 << (8 * (i - 8))) - 1 } else { 0 };
+        i += 1;
+    }
+    m
+}
+static BYTES: [[u64; 2]; COMPACT_MAX + 1] = bytes_table();
+
 /// Key of the non-empty field `buf[s..e]`.
 #[inline(always)]
 pub fn make_key(buf: &[u8], s: usize, e: usize) -> Key {
@@ -84,35 +185,20 @@ pub fn make_key(buf: &[u8], s: usize, e: usize) -> Key {
     if len > COMPACT_MAX {
         return long_key(&buf[s..e]);
     }
-    let (lo, hi) = if s + 16 <= buf.len() {
+    let (codes, valid) = if s + 16 <= buf.len() {
         // SAFETY: 16 bytes starting at s are inside buf.
-        unsafe {
-            let p = buf.as_ptr().add(s);
-            (
-                u64::from_le(std::ptr::read_unaligned(p as *const u64)),
-                u64::from_le(std::ptr::read_unaligned(p.add(8) as *const u64)),
-            )
-        }
+        codes16(unsafe { &*(buf.as_ptr().add(s) as *const [u8; 16]) })
     } else {
         let mut t = [0u8; 16];
         t[..len].copy_from_slice(&buf[s..e]);
-        (u64::from_le_bytes(t[..8].try_into().unwrap()), u64::from_le_bytes(t[8..].try_into().unwrap()))
+        codes16(&t)
     };
-    // All ten positions are coded; those past the field are cut off after.
-    let mut k = 0u64;
-    let mut bad = 0u32;
-    let mut i = 0;
-    while i < COMPACT_MAX {
-        let byte = if i < 8 { (lo >> (8 * i)) as u8 } else { (hi >> (8 * (i - 8))) as u8 };
-        let c = CODE[byte as usize];
-        k |= ((c & 63) as u64) << (58 - 6 * i);
-        bad |= ((c >> 7) as u32) << i;
-        i += 1;
-    }
-    if bad & ((1u32 << len) - 1) != 0 {
+    // All 16 positions were coded; those past the field are cut off here.
+    let want = BYTES[len];
+    if (!valid[0] & want[0]) | (!valid[1] & want[1]) != 0 {
         return long_key(&buf[s..e]);
     }
-    k & KEEP[len]
+    ((pack8(codes[0]) << 16) | (pack8(codes[1] & 0xFFFF) >> 32)) & KEEP[len]
 }
 
 #[inline(always)]
@@ -478,6 +564,38 @@ mod tests {
             for k in (0..2 * range.min(100_000) + 2).map(|k| (k + 1) << 4) {
                 assert_eq!(m.get_or(k, u64::MAX), h.get(&k).copied().unwrap_or(u64::MAX));
             }
+        }
+    }
+
+    #[test]
+    fn vector_codes_match_table() {
+        let mut x = 0xC0DE_C0DE_1234_5678u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut b = [0u8; 16];
+        for i in 0..=255u8 {
+            b = [i; 16];
+            assert_eq!(codes16(&b), codes16_table(&b));
+        }
+        for case in 0..200_000 {
+            for c in b.iter_mut() {
+                let r = rnd();
+                *c = if case % 3 == 0 { r as u8 } else { ALPHA[(r % 63) as usize] ^ ((r >> 20) % 5 == 0) as u8 };
+            }
+            assert_eq!(codes16(&b), codes16_table(&b), "{:?}", b);
+        }
+        // pack8 against the definition
+        for _ in 0..10_000 {
+            let c = rnd() & 0x3F3F_3F3F_3F3F_3F3F;
+            let mut want = 0u64;
+            for i in 0..8 {
+                want |= ((c >> (8 * i)) & 63) << (42 - 6 * i);
+            }
+            assert_eq!(pack8(c), want);
         }
     }
 }
