@@ -160,17 +160,22 @@ pub fn map_ro(fd: i32, len: usize) -> Option<*const u8> {
 /// aligned to 2 MB and advised for transparent huge pages, which cuts page
 /// faults and TLB misses for the scatter buffers and the link map.
 pub fn big_alloc(bytes: usize) -> *mut u8 {
+    const HUGE: usize = 2 << 20;
+    let len = (bytes.max(1) + HUGE - 1) & !(HUGE - 1);
+    // MAP_PRIVATE | MAP_ANONYMOUS
     #[cfg(target_os = "linux")]
-    unsafe {
-        const HUGE: usize = 2 << 20;
-        let len = (bytes.max(1) + HUGE - 1) & !(HUGE - 1);
-        // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS
-        let p = mmap(std::ptr::null_mut(), len + HUGE, 3, 0x22, -1, 0);
-        if p as isize != -1 && !p.is_null() {
-            let a = ((p as usize + HUGE - 1) & !(HUGE - 1)) as *mut u8;
+    const FLAGS: i32 = 0x22;
+    #[cfg(not(target_os = "linux"))]
+    const FLAGS: i32 = 0x1002;
+    // PROT_READ | PROT_WRITE
+    let p = unsafe { mmap(std::ptr::null_mut(), len + HUGE, 3, FLAGS, -1, 0) };
+    if p as isize != -1 && !p.is_null() {
+        let a = ((p as usize + HUGE - 1) & !(HUGE - 1)) as *mut u8;
+        #[cfg(target_os = "linux")]
+        unsafe {
             madvise(a, len, 14); // MADV_HUGEPAGE; fine if it is refused
-            return a;
         }
+        return a;
     }
     let layout = std::alloc::Layout::from_size_align(bytes.max(1), 4096).unwrap();
     let p = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -216,6 +221,24 @@ impl KMap {
             }
             if s.k == 0 {
                 return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    /// Like `get_or_insert`, and says which slot holds `k`.
+    #[inline(always)]
+    pub fn get_or_insert_at(&mut self, k: Key, v: u128) -> (u128, usize) {
+        let mut i = hash(k) as usize & self.mask;
+        loop {
+            let s = unsafe { &mut *self.slots.add(i) };
+            if s.k == k {
+                return (s.v, i);
+            }
+            if s.k == 0 {
+                s.k = k;
+                s.v = v;
+                return (v, i);
             }
             i = (i + 1) & self.mask;
         }

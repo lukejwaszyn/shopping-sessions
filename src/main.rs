@@ -12,6 +12,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::OnceLock;
 use std::time::Instant;
 use ts::{parse_digits, parse_dt_c, parse_ts, DateCache};
 
@@ -23,7 +24,7 @@ const INVALID: i64 = i64::MIN;
 
 // ---------------------------------------------------------------- records
 
-/// A parsed event row on its way to the dedup, 56 bytes.
+/// A parsed, valid event row waiting for its person to be resolved, 56 bytes.
 #[derive(Clone, Copy)]
 #[repr(C, packed(8))]
 struct ERec {
@@ -37,7 +38,19 @@ struct ERec {
     cat: u32,
 }
 
-/// A surviving event, attached to its person.
+/// One event row as the dedup sees it: its ID, its ingest time and where its
+/// `PRec` lives (null for a row that failed validation). 32 bytes.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DRec {
+    ek: Key,
+    /// ingest_ts, epoch seconds
+    ing: i64,
+    ptr: *mut PRec,
+}
+
+/// A valid event, attached to its person. The dedup sets `ts` to `INVALID`
+/// when another copy of the event wins.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PRec {
@@ -64,7 +77,7 @@ struct Clk {
     camp: u32,
 }
 
-const ECAP: usize = 128;
+const DCAP: usize = 256;
 const PCAP: usize = 256;
 const CCAP: usize = 128;
 
@@ -123,6 +136,19 @@ impl<T: Copy> Buckets<T> {
         let c = unsafe { self.cur.get_unchecked_mut(p) };
         unsafe { c.0.add(c.1 as usize).write(r) };
         c.1 += 1;
+    }
+
+    /// Like `push`, and says where the record now lives. Records never move.
+    #[inline(always)]
+    fn push_ptr(&mut self, p: usize, r: T) -> *mut T {
+        if unsafe { self.cur.get_unchecked(p).1 } == self.cap {
+            self.grow(p);
+        }
+        let c = unsafe { self.cur.get_unchecked_mut(p) };
+        let at = unsafe { c.0.add(c.1 as usize) };
+        unsafe { at.write(r) };
+        c.1 += 1;
+        at
     }
 
     #[cold]
@@ -311,7 +337,63 @@ fn parse_links(buf: &[u8], out: &mut Vec<(Key, Key)>) {
     }
 }
 
-fn parse_events(buf: &[u8], cx: &Ctx, out: &mut Buckets<ERec>) {
+/// One thread's event output: dedup records scattered by event_id, valid
+/// events scattered by person. A valid event needs the link map to find its
+/// person; while the union-find is still running such events wait in
+/// `backlog`, afterwards they pass through a small ring while the link-map
+/// slot of their user is fetched from memory.
+struct EvOut {
+    d: Buckets<DRec>,
+    p: Buckets<PRec>,
+    ring: [ERec; RING],
+    n: usize,
+    backlog: Vec<ERec>,
+}
+
+const RING: usize = 16;
+
+impl EvOut {
+    fn new(cx: &Ctx) -> EvOut {
+        EvOut {
+            d: Buckets::new(1 << cx.pe_bits, DCAP),
+            p: Buckets::new(1 << cx.pp_bits, PCAP),
+            ring: [ERec { ek: 0, uk: 0, ts: 0, ing: 0, price: 0, cat: 0 }; RING],
+            n: 0,
+            backlog: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn resolve(&mut self, cx: &Ctx, links: &KMap, r: ERec) {
+        let person = links.get(r.uk).unwrap_or(r.uk);
+        let rec = PRec { person, ts: r.ts, price: r.price, cat: r.cat };
+        let ptr = self.p.push_ptr(part(hash(person), cx.pp_bits), rec);
+        self.d.push(part(hash(r.ek), cx.pe_bits), DRec { ek: r.ek, ing: r.ing, ptr });
+    }
+
+    /// Resolve everything that is waiting.
+    fn flush(&mut self, cx: &Ctx, links: &KMap) {
+        for i in 0..self.n.min(RING) {
+            let r = self.ring[i];
+            self.resolve(cx, links, r);
+        }
+        self.n = 0;
+        let backlog = std::mem::take(&mut self.backlog);
+        for i in 0..backlog.len() {
+            if i + 12 < backlog.len() {
+                prefetch(links.slot_ptr(backlog[i + 12].uk));
+            }
+            self.resolve(cx, links, backlog[i]);
+        }
+    }
+}
+
+fn parse_events(buf: &[u8], cx: &Ctx, links: Option<&KMap>, out: &mut EvOut) {
+    if let Some(l) = links {
+        if !out.backlog.is_empty() {
+            out.flush(cx, l);
+        }
+    }
     let mut sc = Scanner::new(buf);
     let mut pos = [0usize; 8];
     let mut f = [(0usize, 0usize); 7];
@@ -360,7 +442,21 @@ fn parse_events(buf: &[u8], cx: &Ctx, out: &mut Buckets<ERec>) {
             rec.uk = make_key(buf, us, ue);
             rec.ts = ts;
         }
-        out.push(part(hash(ek), cx.pe_bits), rec);
+        if rec.ts == INVALID {
+            // Not a surviving event, but it still takes part in the dedup.
+            out.d.push(part(hash(ek), cx.pe_bits), DRec { ek, ing: rec.ing, ptr: std::ptr::null_mut() });
+        } else if let Some(links) = links {
+            prefetch(links.slot_ptr(rec.uk));
+            let slot = out.n % RING;
+            if out.n >= RING {
+                let r = out.ring[slot];
+                out.resolve(cx, links, r);
+            }
+            out.ring[slot] = rec;
+            out.n += 1;
+        } else {
+            out.backlog.push(rec);
+        }
     }
 }
 
@@ -371,7 +467,6 @@ fn parse_clicks(buf: &[u8], cx: &Ctx, links: &KMap, out: &mut Buckets<CRec>) {
     let mut dc = DateCache::new();
     // Valid clicks wait in a small ring while the link-map slot of their
     // user is fetched from memory.
-    const RING: usize = 16;
     let mut ring = [CRec { person: 0, ck: 0, ts: 0, camp: 0 }; RING];
     let mut n = 0usize;
     let mut resolve = |r: CRec| {
@@ -413,9 +508,12 @@ fn parse_clicks(buf: &[u8], cx: &Ctx, links: &KMap, out: &mut Buckets<CRec>) {
 fn build_links(lists: Vec<Vec<(Key, Key)>>) -> KMap {
     let lines: usize = lists.iter().map(|l| l.len()).sum();
     let mut map = KMap::new(2 * lines);
-    let mut parent: Vec<u32> = Vec::new();
-    let mut size: Vec<u32> = Vec::new();
-    let mut keys: Vec<Key> = Vec::new();
+    let mut parent: Vec<u32> = Vec::with_capacity(2 * lines);
+    let mut size: Vec<u32> = Vec::with_capacity(2 * lines);
+    // best[root]: the smallest ID of the root's component
+    let mut best: Vec<Key> = Vec::with_capacity(2 * lines);
+    // where each ID sits in the map
+    let mut slot_of: Vec<u32> = Vec::with_capacity(2 * lines);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let g = parent[parent[x as usize] as usize];
@@ -424,15 +522,21 @@ fn build_links(lists: Vec<Vec<(Key, Key)>>) -> KMap {
         }
         x
     }
+    const AHEAD: usize = 12;
     for l in &lists {
-        for &(a, b) in l {
+        for (i, &(a, b)) in l.iter().enumerate() {
+            if let Some(&(pa, pb)) = l.get(i + AHEAD) {
+                prefetch(map.slot_ptr(pa));
+                prefetch(map.slot_ptr(pb));
+            }
             let mut id = |k: Key| -> u32 {
-                let next = keys.len() as u128;
-                let v = map.get_or_insert(k, next);
+                let next = best.len() as u128;
+                let (v, slot) = map.get_or_insert_at(k, next);
                 if v == next {
-                    keys.push(k);
+                    best.push(k);
                     parent.push(next as u32);
                     size.push(1);
+                    slot_of.push(slot as u32);
                 }
                 v as u32
             };
@@ -450,34 +554,35 @@ fn build_links(lists: Vec<Vec<(Key, Key)>>) -> KMap {
             }
             parent[rb as usize] = ra;
             size[ra as usize] += size[rb as usize];
+            if key_cmp(best[rb as usize], best[ra as usize]) == Ordering::Less {
+                best[ra as usize] = best[rb as usize];
+            }
         }
     }
-    let mut best = keys.clone();
-    for i in 0..keys.len() {
-        let r = find(&mut parent, i as u32) as usize;
-        if key_cmp(keys[i], best[r]) == Ordering::Less {
-            best[r] = keys[i];
+    // Replace each ID's number by its person's name.
+    let slots = map.slots_mut();
+    for i in 0..slot_of.len() {
+        if let Some(&s) = slot_of.get(i + AHEAD) {
+            prefetch(&slots[s as usize]);
         }
-    }
-    for s in map.slots_mut().iter_mut() {
-        if s.k != 0 {
-            s.v = best[find(&mut parent, s.v as u32) as usize];
-        }
+        let name = best[find(&mut parent, i as u32) as usize];
+        slots[slot_of[i] as usize].v = name;
     }
     map
 }
 
 // ---------------------------------------------------------------- dedup
 
-/// Dedup one event partition on event_id (smallest ingest_ts wins, before
-/// validation), then send the survivors to their person's partition.
-fn dedup_partition(chunks: &[(*mut ERec, usize)], tbl: &mut Vec<u64>, links: &KMap, cx: &Ctx, out: &mut Buckets<PRec>) {
+/// Dedup one event partition on event_id: the copy with the smallest
+/// ingest_ts wins (before validation), every other copy that is a valid event
+/// is struck out where it sits in its person partition.
+fn dedup_partition(chunks: &[(*mut DRec, usize)], tbl: &mut Vec<u64>) {
     if chunks.is_empty() {
         return;
     }
     // Slot: tag (32 hash bits) << 32 | record number + 1. Records are numbered
-    // chunk * ECAP + index; a tag match is confirmed on the full key.
-    let nslots = (chunks.len() * ECAP * 2).next_power_of_two();
+    // chunk * DCAP + index; a tag match is confirmed on the full key.
+    let nslots = (chunks.len() * DCAP * 2).next_power_of_two();
     tbl.clear();
     tbl.resize(nslots, 0);
     let mask = nslots - 1;
@@ -488,7 +593,7 @@ fn dedup_partition(chunks: &[(*mut ERec, usize)], tbl: &mut Vec<u64>, links: &KM
                 let ek = (*r).ek;
                 let h = hash(ek);
                 let tag = (h >> 20) & 0xFFFF_FFFF;
-                let me = (tag << 32) | ((ci * ECAP + i) as u64 + 1);
+                let me = (tag << 32) | ((ci * DCAP + i) as u64 + 1);
                 let mut s = h as usize & mask;
                 loop {
                     let v = *tbl.get_unchecked(s);
@@ -498,30 +603,21 @@ fn dedup_partition(chunks: &[(*mut ERec, usize)], tbl: &mut Vec<u64>, links: &KM
                     }
                     if v >> 32 == tag {
                         let og = (v & 0xFFFF_FFFF) as usize - 1;
-                        let o = chunks.get_unchecked(og / ECAP).0.add(og % ECAP);
+                        let o = chunks.get_unchecked(og / DCAP).0.add(og % DCAP);
                         if (*o).ek == ek {
-                            if (*r).ing < (*o).ing {
-                                (*o).ts = INVALID;
+                            let loser = if (*r).ing < (*o).ing {
                                 *tbl.get_unchecked_mut(s) = me;
+                                (*o).ptr
                             } else {
-                                (*r).ts = INVALID;
+                                (*r).ptr
+                            };
+                            if !loser.is_null() {
+                                (*loser).ts = INVALID;
                             }
                             break;
                         }
                     }
                     s = (s + 1) & mask;
-                }
-            }
-        }
-        for &(ptr, len) in chunks {
-            for i in 0..len {
-                if i + 8 < len {
-                    prefetch(links.slot_ptr((*ptr.add(i + 8)).uk));
-                }
-                let r = ptr.add(i).read();
-                if r.ts != INVALID {
-                    let person = links.get(r.uk).unwrap_or(r.uk);
-                    out.push(part(hash(person), cx.pp_bits), PRec { person, ts: r.ts, price: r.price, cat: r.cat });
                 }
             }
         }
@@ -751,12 +847,13 @@ impl Sess {
     /// Group one person partition by person, then process each person.
     fn partition(&mut self, cx: &Ctx, ebs: &[Buckets<PRec>], cbs: &[Buckets<CRec>], p: usize) {
         all_chunks(ebs, p, &mut self.echunks);
-        let n: usize = self.echunks.iter().map(|c| c.1).sum();
-        if n == 0 {
+        // Upper bound: it still counts the events the dedup struck out.
+        let total: usize = self.echunks.iter().map(|c| c.1).sum();
+        if total == 0 {
             return;
         }
         all_chunks(cbs, p, &mut self.cchunks);
-        let nslots = (2 * n).next_power_of_two().max(16);
+        let nslots = (2 * total).next_power_of_two().max(16);
         let mask = nslots - 1;
         self.tbl.clear();
         self.tbl.resize(nslots, 0);
@@ -766,8 +863,14 @@ impl Sess {
         self.cids.clear();
         unsafe {
             // Pass 1: number the persons, count their events.
+            let mut n = 0usize;
             for &(ptr, len) in &self.echunks {
                 for i in 0..len {
+                    if (*ptr.add(i)).ts == INVALID {
+                        self.eids.push(u32::MAX);
+                        continue;
+                    }
+                    n += 1;
                     let person = (*ptr.add(i)).person;
                     let mut s = hash(person) as usize & mask;
                     let id = loop {
@@ -806,6 +909,9 @@ impl Sess {
                     let r = *ptr.add(i);
                     let id = *self.eids.get_unchecked(j) as usize;
                     j += 1;
+                    if id == u32::MAX as usize {
+                        continue;
+                    }
                     let o = self.eoff.get_unchecked_mut(id);
                     *self.evs.get_unchecked_mut(*o as usize) = pack_ev(r.ts, r.price, r.cat);
                     *o += 1;
@@ -1127,14 +1233,21 @@ fn main() {
     });
     lap("links parsed");
 
-    // ---- events: parse and scatter by event_id, while one thread runs the
-    // union-find
+    // ---- events: parse, scatter the dedup records by event_id and the valid
+    // events by person, while one more thread runs the union-find
     let echunks = make_chunks(&efiles, chunk);
     let next = AtomicUsize::new(0);
-    let (links, ebuckets) = std::thread::scope(|s| {
-        let uf = s.spawn(move || build_links(link_lists));
-        let eb: Vec<Buckets<ERec>> = par_map(nt, |_| {
-            let mut out = Buckets::new(1 << cx.pe_bits, ECAP);
+    let link_cell: OnceLock<KMap> = OnceLock::new();
+    let link_cell = &link_cell;
+    let eouts: Vec<EvOut> = std::thread::scope(|s| {
+        s.spawn(move || {
+            let _ = link_cell.set(build_links(link_lists));
+            if timing {
+                eprintln!("{:>8.1} ms  (links joined)", t0.elapsed().as_secs_f64() * 1e3);
+            }
+        });
+        par_map(nt, |_| {
+            let mut out = EvOut::new(cx);
             loop {
                 let i = next.fetch_add(1, Relaxed);
                 if i >= echunks.len() {
@@ -1143,13 +1256,25 @@ fn main() {
                 let (fi, rs, re) = echunks[i];
                 let buf = efiles[fi].bytes();
                 let (s, e) = chunk_bounds(buf, rs, re);
-                parse_events(&buf[s..e], cx, &mut out);
+                parse_events(&buf[s..e], cx, link_cell.get(), &mut out);
             }
+            let links = loop {
+                match link_cell.get() {
+                    Some(l) => break l,
+                    None => std::thread::yield_now(),
+                }
+            };
+            out.flush(cx, links);
             out
-        });
-        (uf.join().unwrap(), eb)
+        })
     });
-    let links = &links;
+    let links = link_cell.get().unwrap();
+    let mut dbuckets = Vec::with_capacity(eouts.len());
+    let mut pbuckets = Vec::with_capacity(eouts.len());
+    for o in eouts {
+        dbuckets.push(o.d);
+        pbuckets.push(o.p);
+    }
     lap("events parsed, links joined");
 
     // ---- clicks: parse, validate, resolve the person, scatter by person
@@ -1171,22 +1296,20 @@ fn main() {
     });
     lap("clicks parsed");
 
-    // ---- events: dedup per partition, resolve the person, scatter by person
+    // ---- events: dedup per event_id partition
     let next = AtomicUsize::new(0);
-    let ebuckets = &ebuckets;
-    let pbuckets: Vec<Buckets<PRec>> = par_map(nt, |_| {
-        let mut out = Buckets::new(1 << cx.pp_bits, PCAP);
+    let dbuckets = &dbuckets;
+    par_map(nt, |_| {
         let mut tbl: Vec<u64> = Vec::new();
-        let mut chunks: Vec<(*mut ERec, usize)> = Vec::new();
+        let mut chunks: Vec<(*mut DRec, usize)> = Vec::new();
         loop {
             let p = next.fetch_add(1, Relaxed);
             if p >= 1 << cx.pe_bits {
                 break;
             }
-            all_chunks(ebuckets, p, &mut chunks);
-            dedup_partition(&chunks, &mut tbl, links, cx, &mut out);
+            all_chunks(dbuckets, p, &mut chunks);
+            dedup_partition(&chunks, &mut tbl);
         }
-        out
     });
     lap("events deduped");
 
