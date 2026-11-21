@@ -66,8 +66,10 @@ pub struct DateCache {
 
 impl DateCache {
     pub fn new() -> DateCache {
-        // No valid date has zero bytes, so the empty entries never match.
-        DateCache { k1: [0; 32], k2: [0; 32], secs: [0; 32] }
+        // Empty entries must match no input at all, valid or not. k1 covers bytes 0..8 and k2
+        // bytes 7..11, so they share byte 7: k1 = all ones wants it 0xFF, k2 = 0 wants it 0x00.
+        // (All-zero keys would match a ts starting with eleven NUL bytes.)
+        DateCache { k1: [u64::MAX; 32], k2: [0; 32], secs: [0; 32] }
     }
 }
 

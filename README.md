@@ -106,7 +106,7 @@ organizers' starter and use `polars`.
 - `src/ts.rs` timestamp and number parsing
 - `src/pq.rs` Parquet writer
 - `fixtures/`, `scripts/`, `rules.md` from the organizers' kit
-- `fixtures-extra/` five more hand-written edge cases (CRLF, duplicates, long IDs, leap day, number limits)
+- `fixtures-extra/` six more hand-written edge cases (CRLF, duplicates, long IDs, leap day, number limits, NUL bytes)
 
 ## License
 
