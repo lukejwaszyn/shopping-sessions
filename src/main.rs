@@ -5,7 +5,7 @@ mod pq;
 mod scan;
 mod ts;
 
-use key::{big_alloc, compact_bytes, hash, is_long, key_bytes, key_cmp, make_key, map_ro, prefetch, KMap, Key};
+use key::{big_alloc, compact_bytes, hash, is_long, key_bytes, key_cmp, make_key, map_ro, prefetch, BMap, KMap, Key};
 use pq::{Col, ColDef, Ty, Writer};
 use scan::{chunk_bounds, fields, Scanner};
 use std::cmp::Ordering;
@@ -474,14 +474,14 @@ impl EvOut {
     }
 
     #[inline(always)]
-    fn resolve(&mut self, cx: &Ctx, links: &KMap, r: ERec) {
-        let person = links.get(r.uk).unwrap_or(r.uk);
+    fn resolve(&mut self, cx: &Ctx, links: &BMap, r: ERec) {
+        let person = links.get_or(r.uk, r.uk);
         let ptr = self.p.push_ptr(part(hash(person), cx.pp_bits), PRec { person, w: r.w });
         self.dedup_rec(cx, r.ek, r.ing, ptr);
     }
 
     /// Resolve everything that is waiting.
-    fn flush(&mut self, cx: &Ctx, links: &KMap) {
+    fn flush(&mut self, cx: &Ctx, links: &BMap) {
         for i in 0..self.n.min(RING) {
             let r = self.ring[i];
             self.resolve(cx, links, r);
@@ -490,14 +490,14 @@ impl EvOut {
         let backlog = std::mem::take(&mut self.backlog);
         for i in 0..backlog.len() {
             if i + 12 < backlog.len() {
-                prefetch(links.slot_ptr(backlog[i + 12].uk));
+                prefetch(links.bucket_ptr(backlog[i + 12].uk));
             }
             self.resolve(cx, links, backlog[i]);
         }
     }
 }
 
-fn parse_events(buf: &[u8], cx: &Ctx, links: Option<&KMap>, out: &mut EvOut) {
+fn parse_events(buf: &[u8], cx: &Ctx, links: Option<&BMap>, out: &mut EvOut) {
     if let Some(l) = links {
         if !out.backlog.is_empty() {
             out.flush(cx, l);
@@ -566,7 +566,7 @@ fn parse_events(buf: &[u8], cx: &Ctx, links: Option<&KMap>, out: &mut EvOut) {
         // A valid row has a valid ingest_ts.
         let rec = ERec { ek, uk, w, ing: ing.unwrap_or(i64::MAX) };
         if let Some(links) = links {
-            prefetch(links.slot_ptr(uk));
+            prefetch(links.bucket_ptr(uk));
             let slot = out.n % RING;
             if out.n >= RING {
                 let r = out.ring[slot];
@@ -580,7 +580,7 @@ fn parse_events(buf: &[u8], cx: &Ctx, links: Option<&KMap>, out: &mut EvOut) {
     }
 }
 
-fn parse_clicks(buf: &[u8], cx: &Ctx, links: &KMap, out: &mut Buckets<CRec>) {
+fn parse_clicks(buf: &[u8], cx: &Ctx, links: &BMap, out: &mut Buckets<CRec>) {
     let mut sc = Scanner::new(buf);
     let mut pos = [0usize; 8];
     let mut f = [(0usize, 0usize); 4];
@@ -590,7 +590,7 @@ fn parse_clicks(buf: &[u8], cx: &Ctx, links: &KMap, out: &mut Buckets<CRec>) {
     let mut ring = [CRec { person: 0, ck: 0, ts: 0, camp: 0 }; RING];
     let mut n = 0usize;
     let mut resolve = |r: CRec| {
-        let person = links.get(r.person).unwrap_or(r.person);
+        let person = links.get_or(r.person, r.person);
         out.push(part(hash(person), cx.pp_bits), CRec { person, ..r });
     };
     while let Some(l) = sc.next(&mut pos) {
@@ -607,7 +607,7 @@ fn parse_clicks(buf: &[u8], cx: &Ctx, links: &KMap, out: &mut Buckets<CRec>) {
         let Some(camp) = cx.campaigns.get(make_key(buf, f[2].0, f[2].1)) else { continue };
         let uk = make_key(buf, f[1].0, f[1].1);
         let ck = make_key(buf, f[0].0, f[0].1);
-        prefetch(links.slot_ptr(uk));
+        prefetch(links.bucket_ptr(uk));
         let slot = n % RING;
         if n >= RING {
             resolve(ring[slot]);
@@ -625,9 +625,11 @@ fn parse_clicks(buf: &[u8], cx: &Ctx, links: &KMap, out: &mut Buckets<CRec>) {
 
 /// Union-find over all linked IDs. The result maps every linked ID to its
 /// person's name: the byte-wise smallest ID of the component.
-fn build_links(lists: Vec<Vec<(Key, Key)>>) -> KMap {
+fn build_links(lists: Vec<Vec<(Key, Key)>>) -> BMap {
     let lines: usize = lists.iter().map(|l| l.len()).sum();
-    let mut map = KMap::new(2 * lines);
+    // IDs and map slots are numbered in 32 bits.
+    assert!(lines < 1 << 28, "too many link lines");
+    let mut map = BMap::new(2 * lines);
     let mut parent: Vec<u32> = Vec::with_capacity(2 * lines);
     let mut size: Vec<u32> = Vec::with_capacity(2 * lines);
     // best[root]: the smallest ID of the root's component
@@ -646,8 +648,8 @@ fn build_links(lists: Vec<Vec<(Key, Key)>>) -> KMap {
     for l in &lists {
         for (i, &(a, b)) in l.iter().enumerate() {
             if let Some(&(pa, pb)) = l.get(i + AHEAD) {
-                prefetch(map.slot_ptr(pa));
-                prefetch(map.slot_ptr(pb));
+                prefetch(map.bucket_ptr(pa));
+                prefetch(map.bucket_ptr(pb));
             }
             let mut id = |k: Key| -> u32 {
                 let next = best.len() as u64;
@@ -680,13 +682,12 @@ fn build_links(lists: Vec<Vec<(Key, Key)>>) -> KMap {
         }
     }
     // Replace each ID's number by its person's name.
-    let slots = map.slots_mut();
     for i in 0..slot_of.len() {
         if let Some(&s) = slot_of.get(i + AHEAD) {
-            prefetch(&slots[s as usize]);
+            prefetch(map.slot_bucket(s as usize));
         }
         let name = best[find(&mut parent, i as u32) as usize];
-        slots[slot_of[i] as usize].v = name;
+        map.set(slot_of[i] as usize, name);
     }
     map
 }
@@ -1495,7 +1496,7 @@ fn main() {
     // events by person, while one more thread runs the union-find
     let echunks = make_chunks(&efiles, chunk);
     let next = AtomicUsize::new(0);
-    let link_cell: OnceLock<KMap> = OnceLock::new();
+    let link_cell: OnceLock<BMap> = OnceLock::new();
     let link_cell = &link_cell;
     let eouts: Vec<EvOut> = std::thread::scope(|s| {
         s.spawn(move || {

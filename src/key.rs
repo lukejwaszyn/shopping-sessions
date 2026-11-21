@@ -257,15 +257,6 @@ impl KMap {
         KMap { slots, mask: cap - 1 }
     }
 
-    pub fn slots_mut(&mut self) -> &mut [Slot] {
-        unsafe { std::slice::from_raw_parts_mut(self.slots, self.mask + 1) }
-    }
-
-    #[inline(always)]
-    pub fn slot_ptr(&self, k: Key) -> *const Slot {
-        unsafe { self.slots.add(hash(k) as usize & self.mask) }
-    }
-
     #[inline(always)]
     pub fn get(&self, k: Key) -> Option<u64> {
         let mut i = hash(k) as usize & self.mask;
@@ -276,24 +267,6 @@ impl KMap {
             }
             if s.k == 0 {
                 return None;
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-
-    /// Like `get_or_insert`, and says which slot holds `k`.
-    #[inline(always)]
-    pub fn get_or_insert_at(&mut self, k: Key, v: u64) -> (u64, usize) {
-        let mut i = hash(k) as usize & self.mask;
-        loop {
-            let s = unsafe { &mut *self.slots.add(i) };
-            if s.k == k {
-                return (s.v, i);
-            }
-            if s.k == 0 {
-                s.k = k;
-                s.v = v;
-                return (v, i);
             }
             i = (i + 1) & self.mask;
         }
@@ -315,6 +288,95 @@ impl KMap {
             }
             i = (i + 1) & self.mask;
         }
+    }
+}
+
+/// One cache line of the link map: up to four keys and their values. The
+/// keys fill up from the front, so `k[3] == 0` says the bucket has room.
+#[repr(C, align(64))]
+pub struct Bucket {
+    k: [Key; 4],
+    v: [u64; 4],
+}
+
+/// Fixed-capacity map from exact keys to a 64-bit value, in buckets of one
+/// cache line: a lookup touches one line and, unless the bucket is full, has
+/// no branch that depends on the data. A key that finds its bucket full goes
+/// to the next one.
+pub struct BMap {
+    b: *mut Bucket,
+    mask: usize,
+}
+
+unsafe impl Send for BMap {}
+unsafe impl Sync for BMap {}
+
+impl BMap {
+    /// `max` is an upper bound on the number of distinct keys; the buckets
+    /// are at most half full on average.
+    pub fn new(max: usize) -> BMap {
+        let nb = (max / 2 + 2).next_power_of_two();
+        let b = big_alloc(nb * std::mem::size_of::<Bucket>()) as *mut Bucket;
+        BMap { b, mask: nb - 1 }
+    }
+
+    /// Where the lookup of `k` starts, for prefetching.
+    #[inline(always)]
+    pub fn bucket_ptr(&self, k: Key) -> *const Bucket {
+        unsafe { self.b.add(hash(k) as usize & self.mask) }
+    }
+
+    /// Where slot `slot` (as returned by `get_or_insert_at`) lives.
+    #[inline(always)]
+    pub fn slot_bucket(&self, slot: usize) -> *const Bucket {
+        unsafe { self.b.add(slot >> 2) }
+    }
+
+    /// The value stored for `k`, or `default`.
+    #[inline(always)]
+    pub fn get_or(&self, k: Key, default: u64) -> u64 {
+        let mut i = hash(k) as usize & self.mask;
+        loop {
+            let b = unsafe { &*self.b.add(i) };
+            let mut r = default;
+            let mut found = false;
+            for j in 0..4 {
+                let m = b.k[j] == k;
+                found |= m;
+                r = if m { b.v[j] } else { r };
+            }
+            if found | (b.k[3] == 0) {
+                return r;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    /// Value already stored for `k`, or `v` after storing it; and the slot
+    /// that holds `k`.
+    #[inline(always)]
+    pub fn get_or_insert_at(&mut self, k: Key, v: u64) -> (u64, usize) {
+        let mut i = hash(k) as usize & self.mask;
+        loop {
+            let b = unsafe { &mut *self.b.add(i) };
+            for j in 0..4 {
+                if b.k[j] == k {
+                    return (b.v[j], i * 4 + j);
+                }
+                if b.k[j] == 0 {
+                    b.k[j] = k;
+                    b.v[j] = v;
+                    return (v, i * 4 + j);
+                }
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    /// Replace the value in slot `slot`.
+    #[inline(always)]
+    pub fn set(&mut self, slot: usize, v: u64) {
+        unsafe { (*self.b.add(slot >> 2)).v[slot & 3] = v };
     }
 }
 
@@ -382,6 +444,39 @@ mod tests {
             for j in (i + 1..strs.len()).step_by(1 + i % 7) {
                 assert_eq!(keys[i] == keys[j], strs[i] == strs[j]);
                 assert_eq!(key_cmp(keys[i], keys[j]), strs[i].cmp(&strs[j]), "{:?} {:?}", strs[i], strs[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn bucket_map_matches_hash_map() {
+        let mut x = 0x0DDB_1A5E_5BAD_5EEDu64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for &(n, range) in &[(0usize, 10u64), (1, 1), (7, 5), (3000, 1500), (3000, 1 << 40), (40_000, 30_000)] {
+            let mut m = BMap::new(n);
+            let mut h: HashMap<Key, u64> = HashMap::new();
+            let mut slots: HashMap<Key, usize> = HashMap::new();
+            for i in 0..n {
+                let k = (1 + rnd() % range) << 4;
+                let v = i as u64;
+                let (got, slot) = m.get_or_insert_at(k, v);
+                let want = *h.entry(k).or_insert(v);
+                assert_eq!(got, want);
+                assert_eq!(*slots.entry(k).or_insert(slot), slot);
+            }
+            for (&k, &slot) in &slots {
+                if k % 3 == 0 {
+                    m.set(slot, k ^ 5);
+                    h.insert(k, k ^ 5);
+                }
+            }
+            for k in (0..2 * range.min(100_000) + 2).map(|k| (k + 1) << 4) {
+                assert_eq!(m.get_or(k, u64::MAX), h.get(&k).copied().unwrap_or(u64::MAX));
             }
         }
     }
