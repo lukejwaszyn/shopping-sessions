@@ -44,17 +44,90 @@ pub fn parse_dt(b: &[u8]) -> Option<i64> {
     Some(days * 86_400 + (h * 3600 + mi * 60 + s) as i64)
 }
 
+#[inline(always)]
+fn load64(b: &[u8], i: usize) -> u64 {
+    debug_assert!(i + 8 <= b.len());
+    u64::from_le(unsafe { std::ptr::read_unaligned(b.as_ptr().add(i) as *const u64) })
+}
+
+/// True when all 8 bytes are in 0..=9.
+#[inline(always)]
+fn all_le9(t: u64) -> bool {
+    (t.wrapping_add(0x7676_7676_7676_7676) | t) & 0x8080_8080_8080_8080 == 0
+}
+
+/// Remembers the epoch seconds of the dates seen, keyed by the exact bytes
+/// `YYYY-MM-DDT`, so the calendar work is done once per distinct date.
+pub struct DateCache {
+    k1: [u64; 32],
+    k2: [u32; 32],
+    secs: [i64; 32],
+}
+
+impl DateCache {
+    pub fn new() -> DateCache {
+        // No valid date has zero bytes, so the empty entries never match.
+        DateCache { k1: [0; 32], k2: [0; 32], secs: [0; 32] }
+    }
+}
+
+/// Same as `parse_dt`, through the date cache. `b.len() >= 19`.
+#[inline(always)]
+pub fn parse_dt_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
+    let k1 = load64(b, 0); // YYYY-MM-
+    let k2 = load64(b, 3) >> 32; // -DDT
+    let k2 = k2 as u32;
+    let i = ((((k2 >> 8) & 15) * 10 + ((k2 >> 16) & 15)) & 31) as usize;
+    if dc.k1[i] == k1 && dc.k2[i] == k2 {
+        // HH:MM:SS
+        let t = load64(b, 11) ^ 0x3030_3A30_303A_3030;
+        if !all_le9(t) || t & 0x0000_FF00_00FF_0000 != 0 {
+            return None;
+        }
+        let h = (t & 15) * 10 + ((t >> 8) & 15);
+        let mi = ((t >> 24) & 15) * 10 + ((t >> 32) & 15);
+        let s = ((t >> 48) & 15) * 10 + (t >> 56);
+        if h > 23 || mi > 59 || s > 59 {
+            return None;
+        }
+        return Some(dc.secs[i] + (h * 3600 + mi * 60 + s) as i64);
+    }
+    let r = parse_dt(b)?;
+    dc.k1[i] = k1;
+    dc.k2[i] = k2;
+    dc.secs[i] = r - r.rem_euclid(86_400);
+    Some(r)
+}
+
+/// Value of 8 ASCII digits loaded little-endian, or `None`.
+#[inline(always)]
+fn parse8(x: u64) -> Option<u64> {
+    let t = x ^ 0x3030_3030_3030_3030;
+    if !all_le9(t) {
+        return None;
+    }
+    let v = (t.wrapping_mul(10) + (t >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let v = (v.wrapping_mul(100) + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+    Some((v.wrapping_mul(10_000) + (v >> 32)) & 0xFFFF_FFFF)
+}
+
 /// A `ts` field (F1, F2 or F3) to epoch milliseconds; `None` if it is bad.
 /// An F3 value too large to matter (more than 18 significant digits) is
 /// reported as `None`: it is outside every window.
 #[inline(always)]
-pub fn parse_ts(b: &[u8]) -> Option<i64> {
+pub fn parse_ts(b: &[u8], dc: &mut DateCache) -> Option<i64> {
     let n = b.len();
     if n == 20 && b[19] == b'Z' {
-        return parse_dt(b).map(|s| s * 1000);
+        return parse_dt_c(b, dc).map(|s| s * 1000);
+    }
+    if n == 13 {
+        // The usual F3: 13 digits, as two overlapping groups of 8.
+        let hi = parse8(load64(b, 0))?;
+        let lo = parse8(load64(b, 5))?;
+        return Some((hi * 100_000 + lo % 100_000) as i64);
     }
     if n == 25 && (b[19] == b'+' || b[19] == b'-') {
-        let s = parse_dt(b)?;
+        let s = parse_dt_c(b, dc)?;
         let d = |i: usize| -> u32 { b[i].wrapping_sub(b'0') as u32 };
         if d(20) > 9 || d(21) > 9 || b[22] != b':' || d(23) > 9 || d(24) > 9 {
             return None;

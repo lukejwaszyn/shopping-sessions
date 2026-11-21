@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
-use ts::{parse_digits, parse_dt, parse_ts};
+use ts::{parse_digits, parse_dt_c, parse_ts, DateCache};
 
 const GAP_MS: i64 = 1_800_000;
 const WEEK_MS: i64 = 604_800_000;
@@ -301,7 +301,7 @@ fn manifest_ts(text: &[u8], name: &str) -> i64 {
     let rest = &text[i..];
     let a = rest.iter().position(|&c| c == b'"').expect("manifest.json: value") + 1;
     let b = a + rest[a..].iter().position(|&c| c == b'"').expect("manifest.json: value");
-    parse_ts(&rest[a..b]).unwrap_or_else(|| panic!("manifest.json: bad {}", name))
+    parse_ts(&rest[a..b], &mut DateCache::new()).unwrap_or_else(|| panic!("manifest.json: bad {}", name))
 }
 
 // ---------------------------------------------------------------- parsing
@@ -325,6 +325,7 @@ fn parse_events(buf: &[u8], cx: &Ctx, out: &mut Buckets<ERec>) {
     let mut sc = Scanner::new(buf);
     let mut pos = [0usize; 8];
     let mut f = [(0usize, 0usize); 7];
+    let mut dc = DateCache::new();
     while let Some(l) = sc.next(&mut pos) {
         if !fields(buf, &l, &pos, &mut f) {
             continue;
@@ -334,7 +335,7 @@ fn parse_events(buf: &[u8], cx: &Ctx, out: &mut Buckets<ERec>) {
         }
         let ek = make_key(buf, f[0].0, f[0].1);
         let ib = &buf[f[3].0..f[3].1];
-        let ing = if ib.len() == 20 && ib[19] == b'Z' { parse_dt(ib) } else { None };
+        let ing = if ib.len() == 20 && ib[19] == b'Z' { parse_dt_c(ib, &mut dc) } else { None };
         let mut rec = ERec { ek, uk: 0, ts: INVALID, ing: ing.unwrap_or(i64::MAX), price: 0, cat: 0 };
         'v: {
             let Some(ing) = ing else { break 'v };
@@ -343,7 +344,7 @@ fn parse_events(buf: &[u8], cx: &Ctx, out: &mut Buckets<ERec>) {
             if us == ue || ps == pe {
                 break 'v;
             }
-            let Some(ts) = parse_ts(&buf[f[2].0..f[2].1]) else { break 'v };
+            let Some(ts) = parse_ts(&buf[f[2].0..f[2].1], &mut dc) else { break 'v };
             if ts < cx.ws || ts >= cx.we {
                 break 'v;
             }
@@ -377,6 +378,16 @@ fn parse_clicks(buf: &[u8], cx: &Ctx, links: &KMap, out: &mut Buckets<CRec>) {
     let mut sc = Scanner::new(buf);
     let mut pos = [0usize; 8];
     let mut f = [(0usize, 0usize); 4];
+    let mut dc = DateCache::new();
+    // Valid clicks wait in a small ring while the link-map slot of their
+    // user is fetched from memory.
+    const RING: usize = 16;
+    let mut ring = [CRec { person: 0, ck: 0, ts: 0, camp: 0 }; RING];
+    let mut n = 0usize;
+    let mut resolve = |r: CRec| {
+        let person = links.get(r.person).unwrap_or(r.person);
+        out.push(part(hash(person), cx.pp_bits), CRec { person, ..r });
+    };
     while let Some(l) = sc.next(&mut pos) {
         if !fields(buf, &l, &pos, &mut f) {
             continue;
@@ -384,15 +395,24 @@ fn parse_clicks(buf: &[u8], cx: &Ctx, links: &KMap, out: &mut Buckets<CRec>) {
         if f[0].0 == f[0].1 || f[1].0 == f[1].1 || f[2].0 == f[2].1 {
             continue;
         }
-        let Some(ts) = parse_ts(&buf[f[3].0..f[3].1]) else { continue };
+        let Some(ts) = parse_ts(&buf[f[3].0..f[3].1], &mut dc) else { continue };
         if ts < cx.cws || ts >= cx.we {
             continue;
         }
         let Some(camp) = cx.campaigns.get(make_key(buf, f[2].0, f[2].1)) else { continue };
         let uk = make_key(buf, f[1].0, f[1].1);
-        let person = links.get(uk).unwrap_or(uk);
         let ck = make_key(buf, f[0].0, f[0].1);
-        out.push(part(hash(person), cx.pp_bits), CRec { person, ck, ts, camp: camp as u32 });
+        prefetch(links.slot_ptr(uk));
+        let slot = n % RING;
+        if n >= RING {
+            resolve(ring[slot]);
+        }
+        // `person` holds the user ID until the click is resolved.
+        ring[slot] = CRec { person: uk, ck, ts, camp: camp as u32 };
+        n += 1;
+    }
+    for i in 0..n.min(RING) {
+        resolve(ring[i]);
     }
 }
 

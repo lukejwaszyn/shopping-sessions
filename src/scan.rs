@@ -30,14 +30,15 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     let v = [vld1q_u8(p), vld1q_u8(p.add(16)), vld1q_u8(p.add(32)), vld1q_u8(p.add(48))];
     let m = |c: u8| -> u64 {
         let cv = vdupq_n_u8(c);
-        let mut r = 0u64;
-        for (i, x) in v.iter().enumerate() {
-            let bits = vandq_u8(vceqq_u8(*x, cv), pow);
-            let lo = vaddv_u8(vget_low_u8(bits)) as u64;
-            let hi = vaddv_u8(vget_high_u8(bits)) as u64;
-            r |= (lo | (hi << 8)) << (16 * i);
-        }
-        r
+        let t0 = vandq_u8(vceqq_u8(v[0], cv), pow);
+        let t1 = vandq_u8(vceqq_u8(v[1], cv), pow);
+        let t2 = vandq_u8(vceqq_u8(v[2], cv), pow);
+        let t3 = vandq_u8(vceqq_u8(v[3], cv), pow);
+        let s0 = vpaddq_u8(t0, t1);
+        let s1 = vpaddq_u8(t2, t3);
+        let s0 = vpaddq_u8(s0, s1);
+        let s0 = vpaddq_u8(s0, s0);
+        vgetq_lane_u64(vreinterpretq_u64_u8(s0), 0)
     };
     let nl = m(b'\n');
     (m(b',') | nl, nl, m(b'"'))
