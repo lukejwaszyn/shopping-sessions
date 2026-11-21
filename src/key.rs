@@ -412,12 +412,6 @@ impl BMap {
         unsafe { self.b.add(hash(k) as usize & self.mask) }
     }
 
-    /// Where slot `slot` (as returned by `get_or_insert_at`) lives.
-    #[inline(always)]
-    pub fn slot_bucket(&self, slot: usize) -> *const Bucket {
-        unsafe { self.b.add(slot >> 2) }
-    }
-
     /// The value stored for `k`, or `default`.
     #[inline(always)]
     pub fn get_or(&self, k: Key, default: u64) -> u64 {
@@ -438,31 +432,24 @@ impl BMap {
         }
     }
 
-    /// Value already stored for `k`, or `v` after storing it; and the slot
-    /// that holds `k`.
+    /// Value already stored for `k`, or `v` after storing it.
     #[inline(always)]
-    pub fn get_or_insert_at(&mut self, k: Key, v: u64) -> (u64, usize) {
+    pub fn get_or_insert(&mut self, k: Key, v: u64) -> u64 {
         let mut i = hash(k) as usize & self.mask;
         loop {
             let b = unsafe { &mut *self.b.add(i) };
             for j in 0..4 {
                 if b.k[j] == k {
-                    return (b.v[j], i * 4 + j);
+                    return b.v[j];
                 }
                 if b.k[j] == 0 {
                     b.k[j] = k;
                     b.v[j] = v;
-                    return (v, i * 4 + j);
+                    return v;
                 }
             }
             i = (i + 1) & self.mask;
         }
-    }
-
-    /// Replace the value in slot `slot`.
-    #[inline(always)]
-    pub fn set(&mut self, slot: usize, v: u64) {
-        unsafe { (*self.b.add(slot >> 2)).v[slot & 3] = v };
     }
 }
 
@@ -546,20 +533,12 @@ mod tests {
         for &(n, range) in &[(0usize, 10u64), (1, 1), (7, 5), (3000, 1500), (3000, 1 << 40), (40_000, 30_000)] {
             let mut m = BMap::new(n);
             let mut h: HashMap<Key, u64> = HashMap::new();
-            let mut slots: HashMap<Key, usize> = HashMap::new();
             for i in 0..n {
                 let k = (1 + rnd() % range) << 4;
                 let v = i as u64;
-                let (got, slot) = m.get_or_insert_at(k, v);
+                let got = m.get_or_insert(k, v);
                 let want = *h.entry(k).or_insert(v);
                 assert_eq!(got, want);
-                assert_eq!(*slots.entry(k).or_insert(slot), slot);
-            }
-            for (&k, &slot) in &slots {
-                if k % 3 == 0 {
-                    m.set(slot, k ^ 5);
-                    h.insert(k, k ^ 5);
-                }
             }
             for k in (0..2 * range.min(100_000) + 2).map(|k| (k + 1) << 4) {
                 assert_eq!(m.get_or(k, u64::MAX), h.get(&k).copied().unwrap_or(u64::MAX));

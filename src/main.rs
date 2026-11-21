@@ -627,15 +627,15 @@ fn parse_clicks(buf: &[u8], cx: &Ctx, links: &BMap, out: &mut Buckets<CRec>) {
 /// person's name: the byte-wise smallest ID of the component.
 fn build_links(lists: Vec<Vec<(Key, Key)>>) -> BMap {
     let lines: usize = lists.iter().map(|l| l.len()).sum();
-    // IDs and map slots are numbered in 32 bits.
-    assert!(lines < 1 << 28, "too many link lines");
+    // IDs are numbered in 32 bits.
+    assert!(lines < 1 << 31, "too many link lines");
     let mut map = BMap::new(2 * lines);
     let mut parent: Vec<u32> = Vec::with_capacity(2 * lines);
     let mut size: Vec<u32> = Vec::with_capacity(2 * lines);
     // best[root]: the smallest ID of the root's component
     let mut best: Vec<Key> = Vec::with_capacity(2 * lines);
-    // where each ID sits in the map
-    let mut slot_of: Vec<u32> = Vec::with_capacity(2 * lines);
+    // the IDs in order of their numbers
+    let mut ids: Vec<Key> = Vec::with_capacity(2 * lines);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let g = parent[parent[x as usize] as usize];
@@ -653,12 +653,12 @@ fn build_links(lists: Vec<Vec<(Key, Key)>>) -> BMap {
             }
             let mut id = |k: Key| -> u32 {
                 let next = best.len() as u64;
-                let (v, slot) = map.get_or_insert_at(k, next);
+                let v = map.get_or_insert(k, next);
                 if v == next {
                     best.push(k);
                     parent.push(next as u32);
                     size.push(1);
-                    slot_of.push(slot as u32);
+                    ids.push(k);
                 }
                 v as u32
             };
@@ -681,15 +681,27 @@ fn build_links(lists: Vec<Vec<(Key, Key)>>) -> BMap {
             }
         }
     }
-    // Replace each ID's number by its person's name.
-    for i in 0..slot_of.len() {
-        if let Some(&s) = slot_of.get(i + AHEAD) {
-            prefetch(map.slot_bucket(s as usize));
-        }
+    // The result holds only the IDs whose person has another name: an ID
+    // that is not found is its own person anyway, and a smaller table means
+    // fewer cache and TLB misses for the lookups of every event and click.
+    let n = ids.len();
+    let mut names: Vec<Key> = Vec::with_capacity(n);
+    let mut renamed = 0usize;
+    for i in 0..n {
         let name = best[find(&mut parent, i as u32) as usize];
-        map.set(slot_of[i] as usize, name);
+        renamed += (name != ids[i]) as usize;
+        names.push(name);
     }
-    map
+    let mut out = BMap::new(renamed);
+    for i in 0..n {
+        if i + AHEAD < n {
+            prefetch(out.bucket_ptr(ids[i + AHEAD]));
+        }
+        if names[i] != ids[i] {
+            out.get_or_insert(ids[i], names[i]);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------- dedup
